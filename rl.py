@@ -232,7 +232,7 @@ class Simulator:
                                 max_ev = evs[ev_token]
                                 max_token = ev_token
                         target = torch.lerp(likelihoods.clone(), pre_target, 0.02)
-                        target[max_token] = target[max_token] * 1.5
+                        target[max_token] = target[max_token] * 1.1
                         target = target / target.sum()
                         loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
                         ttl_loss += loss
@@ -260,7 +260,7 @@ class Simulator:
                                     max_ev = evs[ev_token]
                                     max_token = ev_token
                             target = likelihoods.clone()
-                            target[max_token] = target[max_token] * 1.5
+                            target[max_token] = target[max_token] * 1.1
                             target = target / target.sum()
                             loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
                             ttl_loss += loss
