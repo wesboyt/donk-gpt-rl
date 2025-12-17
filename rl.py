@@ -100,8 +100,9 @@ class Simulator:
         min_bet_token = self.min_size_token
         for i, size in enumerate(self.torch_sizes_float):
             temp_size = pot_size * (size / 100)
-            if temp_size >= min_bet:
+            if temp_size <= min_bet:
                 min_bet_token = self.min_size_token + i
+            else:
                 break
 
         bets = likelihoods[min_bet_token:]
