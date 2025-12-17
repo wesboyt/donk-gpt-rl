@@ -35,9 +35,7 @@ class Simulator:
         self.max_size_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
         self.tokenizer.pad_token = self.tokenizer.unk_token
         self.end_token = torch.tensor([2]).to(self.device)
-        self.sizes = list(range(1, 5))
-        self.sizes.extend(list(range(5, 101, 5)))
-        self.sizes.extend(list(range(125, 501, 25)))
+        self.sizes = list(range(1, 5))#define your own sizing buckets
         self.sizes = np.int16(self.sizes)
         self.torch_sizes = torch.tensor(self.sizes).to(self.device)
         self.torch_sizes_float = self.torch_sizes.float()
