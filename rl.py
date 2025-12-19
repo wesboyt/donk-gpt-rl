@@ -98,9 +98,8 @@ class Simulator:
         min_bet_token = self.min_size_token
         for i, size in enumerate(self.torch_sizes_float):
             temp_size = pot_size * (size / 100)
-            if temp_size <= min_bet:
+            if temp_size >= min_bet:
                 min_bet_token = self.min_size_token + i
-            else:
                 break
 
         bets = likelihoods[min_bet_token:]
@@ -122,7 +121,13 @@ class Simulator:
                         hand.call()
                     case 'raise':
                         hand.bet_or_raise(size)
-            payoffs.append(hand.state.payoffs)
+            payoff = hand.state.payoffs
+            """
+            for j, val in enumerate(payoff):
+                if val == 0:
+                    payoff[j] = -1
+            """
+            payoffs.append(payoff)
         return payoffs
 
     def generate_action_evs(self, ohand):
@@ -188,6 +193,7 @@ class Simulator:
 
     def rl(self):
         losses = []
+        shift_cap = 0.03
         for itr in range(50000):
             hand = Hand()
             states = []
@@ -225,14 +231,17 @@ class Simulator:
                     if hh_ids[i-1] == hero_token:
                         #were a hero adjust kldiv more
                         evs = self.generate_action_evs(last_state)
-                        max_ev = -100000
-                        max_token = self.fold_token.item()
+                        max_ev = 0
                         for ev_token in evs.keys():
-                            if evs[ev_token] > max_ev:
-                                max_ev = evs[ev_token]
-                                max_token = ev_token
+                            abs_ev = abs(evs[ev_token])
+                            if abs_ev > max_ev:
+                                max_ev = abs_ev
+                        for ev_token in evs.keys():
+                            evs[ev_token] = evs[ev_token] / max_ev
                         target = torch.lerp(likelihoods.clone(), pre_target, 0.02)
-                        target[max_token] = target[max_token] * 1.1
+                        for ev_token in evs.keys():
+                            target[ev_token] = target[ev_token] + shift_cap * target[ev_token] * evs[ev_token]
+
                         target = target / target.sum()
                         loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
                         ttl_loss += loss
@@ -253,14 +262,17 @@ class Simulator:
                             random_payoffs = self.generate_payoffs(r_hand)
                             token_ev = np.mean(list(map(lambda x: x[player], random_payoffs)))
                             evs = self.generate_raise_evs(last_state)
-                            max_ev = token_ev
-                            max_token = token
+                            evs[token] = token_ev
+                            max_ev = 0
                             for ev_token in evs.keys():
-                                if evs[ev_token] > max_ev:
-                                    max_ev = evs[ev_token]
-                                    max_token = ev_token
+                                abs_ev = abs(evs[ev_token])
+                                if abs_ev > max_ev:
+                                    max_ev = abs_ev
+                            for ev_token in evs.keys():
+                                evs[ev_token] = evs[ev_token] / max_ev
                             target = likelihoods.clone()
-                            target[max_token] = target[max_token] * 1.1
+                            for ev_token in evs.keys():
+                                target[ev_token] = target[ev_token] + shift_cap * target[ev_token] * evs[ev_token]
                             target = target / target.sum()
                             loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
                             ttl_loss += loss
@@ -289,9 +301,10 @@ class Simulator:
                         last_state = states[state_index]
                         state_index += 1
             losses.append(ttl_loss.item())
-            ttl_loss.backward()
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+            if itr % 10 == 0:
+                ttl_loss.backward()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
             if itr % 100 == 0:
                 mean_loss = np.mean(losses)
                 print(mean_loss)
