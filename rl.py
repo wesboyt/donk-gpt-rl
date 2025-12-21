@@ -18,30 +18,33 @@ class Simulator:
         self.tokenizer = GPT2TokenizerFast.from_pretrained('./opt-it-2')
         self.tokenizer.pad_token = self.tokenizer.unk_token
         self.id_to_str = []
-        self.result_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.fold_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.check_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.call_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.flop_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.turn_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.river_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.raise_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.allin_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
+        self.result_token = torch.tensor(self.tokenizer.encode("<result>")).to(self.device)
+        self.fold_token = torch.tensor(self.tokenizer.encode("<fold>")).to(self.device)
+        self.check_token = torch.tensor(self.tokenizer.encode("<check>")).to(self.device)
+        self.call_token = torch.tensor(self.tokenizer.encode("<call>")).to(self.device)
+        self.flop_token = torch.tensor(self.tokenizer.encode("<flop>")).to(self.device)
+        self.turn_token = torch.tensor(self.tokenizer.encode("<turn>")).to(self.device)
+        self.river_token = torch.tensor(self.tokenizer.encode("<river>")).to(self.device)
+        self.raise_token = torch.tensor(self.tokenizer.encode("<raise>")).to(self.device)
+        self.allin_token = torch.tensor(self.tokenizer.encode("<allin>")).to(self.device)
         self.unknown_token = torch.tensor(self.tokenizer.encode("<unk>")).to(self.device)
-        self.equity_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.win_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.lose_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.min_size_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
-        self.max_size_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
+        self.equity_token = torch.tensor(self.tokenizer.encode("<equity>")).to(self.device)
+        self.win_token = torch.tensor(self.tokenizer.encode("<win>")).to(self.device)
+        self.lose_token = torch.tensor(self.tokenizer.encode("<lose>")).to(self.device)
+        self.min_size_token = torch.tensor(self.tokenizer.encode("<b1%>")).to(self.device)
+        self.max_size_token = torch.tensor(self.tokenizer.encode("<b500%>")).to(self.device)
         self.tokenizer.pad_token = self.tokenizer.unk_token
         self.end_token = torch.tensor([2]).to(self.device)
-        self.sizes = list(range(1, 5))#define your own sizing buckets
+        self.sizes = list(range(1, 5))
+        self.sizes.extend(list(range(5, 101, 5)))
+        self.sizes.extend(list(range(125, 501, 25)))
         self.sizes = np.int16(self.sizes)
         self.torch_sizes = torch.tensor(self.sizes).to(self.device)
         self.torch_sizes_float = self.torch_sizes.float()
         self.encoder = Encoder()
         self.loss = torch.nn.KLDivLoss(reduction="batchmean",log_target=True).to(self.device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=3e-4)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        torch.autograd.set_detect_anomaly(True)
 
         for i in range(86):
             self.id_to_str.append(self.tokenizer.decode(i))
@@ -194,6 +197,7 @@ class Simulator:
     def rl(self):
         losses = []
         shift_cap = 0.03
+        ttl_loss = torch.zeros(1).to(self.device)
         for itr in range(50000):
             hand = Hand()
             states = []
@@ -216,7 +220,6 @@ class Simulator:
             print(uh)
             hh_ids = torch.tensor(self.tokenizer.encode(self.encoder.encode(json.dumps(uh)))).to(self.device)
             hero_token = hh_ids[1]
-            ttl_loss = torch.zeros(1).to(self.device)
             state_index = 0
             last_state = states[state_index]
             for i in range(1, hh_ids.shape[0]):
@@ -301,11 +304,12 @@ class Simulator:
                         last_state = states[state_index]
                         state_index += 1
             losses.append(ttl_loss.item())
-            if itr % 10 == 0:
+            if itr % 32 == 0:
                 ttl_loss.backward()
+                ttl_loss = torch.zeros(1).to(self.device)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-            if itr % 100 == 0:
+            if itr % 128 == 0:
                 mean_loss = np.mean(losses)
                 print(mean_loss)
                 losses = []
