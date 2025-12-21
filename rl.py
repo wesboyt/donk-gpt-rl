@@ -228,7 +228,7 @@ class Simulator:
             for i in range(1, hh_ids.shape[0]):
                 token = hh_ids[i]
                 subslice = hh_ids[:i].unsqueeze(0)
-                logits = self.model(subslice).logits[:, -1, :][0]
+                logits = self.model(subslice).logits[:, -1, :]
                 if token <= 13 and token >= 9 and i > 26 and hh_ids[i-1] == hero_token:
                     #were a hero adjust kldiv more
                     evs = self.generate_action_evs(last_state)
