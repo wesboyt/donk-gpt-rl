@@ -42,7 +42,7 @@ class Simulator:
         self.torch_sizes = torch.tensor(self.sizes).to(self.device)
         self.torch_sizes_float = self.torch_sizes.float()
         self.encoder = Encoder()
-        self.loss = torch.nn.KLDivLoss(reduction="batchmean",log_target=True).to(self.device)
+        self.loss = torch.nn.KLDivLoss(reduction="batchmean", log_target=True).to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
         torch.autograd.set_detect_anomaly(True)
 
@@ -111,7 +111,7 @@ class Simulator:
 
     def generate_payoffs(self, hand):
         payoffs = []
-        for i in range(8):
+        for i in range(5):
             hand = copy.deepcopy(hand)
             while not hand.done:
                 action, size = self.select_action(hand)
@@ -174,6 +174,8 @@ class Simulator:
             count += bets[index]
             index += 1
         roll_bet_token = min_bet_token + index
+        if roll_bet_token > self.max_size_token:
+            roll_bet_token = self.max_size_token
         pot_size = ohand.pot_size()
         bet = int(pot_size * self.torch_sizes_float[roll_bet_token - self.min_size_token] / 100)
         hand = copy.deepcopy(ohand)
@@ -196,7 +198,10 @@ class Simulator:
 
     def rl(self):
         losses = []
-        shift_cap = 0.03
+        size_losses = []
+        opp_size_losses = []
+        opp_action_losses = []
+        shift_cap = 0.07
         ttl_loss = torch.zeros(1).to(self.device)
         for itr in range(50000):
             hand = Hand()
@@ -226,93 +231,71 @@ class Simulator:
                 token = hh_ids[i]
                 subslice = hh_ids[:i].unsqueeze(0)
                 logits = self.model(subslice).logits[:, -1, :][0]
-                likelihoods = torch.softmax(logits, 0)
-                if token <= 13 and token >= 9 and i > 26:
-                    #were an action
-                    pre_target = self.get_action_likelihoods(last_state)
-                    pre_target = pre_target / pre_target.sum()
-                    if hh_ids[i-1] == hero_token:
-                        #were a hero adjust kldiv more
-                        evs = self.generate_action_evs(last_state)
-                        max_ev = 0
-                        for ev_token in evs.keys():
-                            abs_ev = abs(evs[ev_token])
-                            if abs_ev > max_ev:
-                                max_ev = abs_ev
-                        for ev_token in evs.keys():
-                            evs[ev_token] = evs[ev_token] / max_ev
-                        target = torch.lerp(likelihoods.clone(), pre_target, 0.02)
-                        for ev_token in evs.keys():
-                            target[ev_token] = target[ev_token] + shift_cap * target[ev_token] * evs[ev_token]
+                if token <= 13 and token >= 9 and i > 26 and hh_ids[i-1] == hero_token:
+                    #were a hero adjust kldiv more
+                    evs = self.generate_action_evs(last_state)
+                    max_ev = 0
+                    for ev_token in evs.keys():
+                        abs_ev = abs(evs[ev_token])
+                        if abs_ev > max_ev:
+                            max_ev = abs_ev
+                    for ev_token in evs.keys():
+                        evs[ev_token] = evs[ev_token] / max_ev
+                    target = logits.clone()
+                    for ev_token in evs.keys():
+                        target[ev_token] = target[ev_token] + shift_cap * target[ev_token] * evs[ev_token]
 
-                        target = target / target.sum()
-                        loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
-                        ttl_loss += loss
-                    else:
-                        target = torch.lerp(likelihoods.clone(), pre_target, 0.02)
-                        loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
-                        ttl_loss += loss
-                elif token >= self.min_size_token and i > 26:
-                    #were a size
-                    if hh_ids[i-1] == self.raise_token:
-                        #were a raise
-                        bets, min_bet_token = self.get_raise_likelihoods(last_state)
-                        if hh_ids[i-2] == hero_token:
-                            #were a hero
-                            bet = int(last_state.pot_size() * self.torch_sizes_float[token - self.min_size_token] / 100)
-                            r_hand = copy.deepcopy(last_state)
-                            r_hand.bet_or_raise(bet)
-                            random_payoffs = self.generate_payoffs(r_hand)
-                            token_ev = np.mean(list(map(lambda x: x[player], random_payoffs)))
-                            evs = self.generate_raise_evs(last_state)
-                            evs[token] = token_ev
-                            max_ev = 0
-                            for ev_token in evs.keys():
-                                abs_ev = abs(evs[ev_token])
-                                if abs_ev > max_ev:
-                                    max_ev = abs_ev
-                            for ev_token in evs.keys():
-                                evs[ev_token] = evs[ev_token] / max_ev
-                            target = likelihoods.clone()
-                            for ev_token in evs.keys():
-                                target[ev_token] = target[ev_token] + shift_cap * target[ev_token] * evs[ev_token]
-                            target = target / target.sum()
-                            loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
-                            ttl_loss += loss
-                        else:
-                            new_bets = torch.zeros(likelihoods.shape).to(self.device)
-                            new_bets[min_bet_token:] = bets
-                            new_bets = new_bets / new_bets.sum()
-                            target = torch.lerp(likelihoods.clone(), new_bets, 0.02)
-                            loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
-                            ttl_loss += loss
-                    else:
-                        target = likelihoods.clone()
-                        target[token] = target[token]
-                        target = target / target.sum()
-                        loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
-                        ttl_loss += loss
-                else:
-                    target = likelihoods.clone()
-                    target[token] = target[token]
                     target = target / target.sum()
-                    loss = self.loss(likelihoods.log().unsqueeze(0), target.log().unsqueeze(0))
+                    loss = self.loss(logits, target)
+                    loss = torch.clamp(loss, min=0, max=1.2)
+                    losses.append(loss.item())
+                    ttl_loss += loss
+                elif token >= self.min_size_token and i > 26 and hh_ids[i-1] == self.raise_token and hh_ids[i-2] == hero_token:
+                    bet = int(last_state.pot_size() * self.torch_sizes_float[token - self.min_size_token] / 100)
+                    r_hand = copy.deepcopy(last_state)
+                    r_hand.bet_or_raise(bet)
+                    random_payoffs = self.generate_payoffs(r_hand)
+                    token_ev = np.mean(list(map(lambda x: x[player], random_payoffs)))
+                    evs = self.generate_raise_evs(last_state)
+                    evs[token] = token_ev
+                    max_ev = 0
+                    for ev_token in evs.keys():
+                        abs_ev = abs(evs[ev_token])
+                        if abs_ev > max_ev:
+                            max_ev = abs_ev
+                    for ev_token in evs.keys():
+                        evs[ev_token] = evs[ev_token] / max_ev
+                    target = logits.clone()
+                    for ev_token in evs.keys():
+                        target[ev_token] = target[ev_token] + shift_cap * target[ev_token] * evs[ev_token]
+                    target = target / target.sum()
+                    loss = self.loss(logits, target)
+                    loss = torch.clamp(loss, min=0, max=1.2)
+                    size_losses.append(loss.item())
+                    ttl_loss += loss
+                else:
+                    loss = self.loss(logits, logits)
+                    loss = torch.clamp(loss, min=0, max=1.2)
                     ttl_loss += loss
                 if i >= 26:
                     if token <= 28 and token >= 17:
                         #found a player token
                         last_state = states[state_index]
                         state_index += 1
-            losses.append(ttl_loss.item())
-            if itr % 32 == 0:
+            if itr % 16 == 0:
                 ttl_loss.backward()
-                ttl_loss = torch.zeros(1).to(self.device)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-            if itr % 128 == 0:
+                ttl_loss = torch.zeros(1).to(self.device)
                 mean_loss = np.mean(losses)
                 print(mean_loss)
+                print("size losses:", np.mean(size_losses))
+                print("oaction:", np.mean(opp_action_losses))
+                print("ozise:", np.mean(opp_size_losses))
                 losses = []
+                size_losses = []
+                opp_action_losses = []
+                opp_size_losses = []
                 torch.save(self.model.state_dict(), "RL-" + str(itr) + "-" + str(mean_loss) + ".pt")
 
     def select_action(self, hnd):
