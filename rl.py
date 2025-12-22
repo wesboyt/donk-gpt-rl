@@ -198,7 +198,7 @@ class Simulator:
         losses = []
         shift_cap = 0.2
         ttl_loss = torch.zeros(1).to(self.device)
-        batch_size = 1
+        batch_size = 16
         for itr in range(0, 50000):
             batch = []
             batch_states = []
