@@ -109,11 +109,11 @@ class Simulator:
             bets = bets / bets.sum()
             return bets, min_bet_token
 
-    def generate_payoffs(self, hand):
+    def generate_payoffs(self, ohand):
         with torch.no_grad():
             payoffs = []
             for i in range(128):
-                hand = copy.deepcopy(hand)
+                hand = copy.deepcopy(ohand)
                 while not hand.done:
                     action, size = self.select_action(hand)
                     match action:
