@@ -200,9 +200,10 @@ class Simulator:
 
     def rl(self):
         losses = []
-        shift_cap = 0.05
+        shift_cap = 0.01
         ttl_loss = torch.zeros(1).to(self.device)
         batch_size = 1
+        tokens_size = batch_size * 6
         for itr in range(0, 50000):
             batch = []
             batch_states = []
@@ -227,7 +228,7 @@ class Simulator:
                     for player in range(6):
                         uh = hand.get_u_hand(player)
                         batch_states.append(states)
-                        batch.append(self.encoder.encode(json.dumps(uh)))
+                        batch.append(self.encoder.encode(json.dumps(uh), True))
                 batch = torch.tensor(self.tokenizer(batch, padding="max_length", max_length=128).input_ids).to(self.device)
             hero_ids = batch[:, 1]
             state_indexes = torch.zeros(batch.shape[0], dtype=torch.int).to(self.device)
@@ -243,7 +244,6 @@ class Simulator:
                     action_token_indexes = torch.argwhere((tokens <= 13) & (tokens >= 9)).squeeze()
                     if action_token_indexes.ndim == 0:
                         action_token_indexes = action_token_indexes.unsqueeze(0)
-
                     hero_action_indexes = action_token_indexes[torch.isin(action_token_indexes, last_hero_tokens)]
                     for index in hero_action_indexes:
                         evs = self.generate_action_evs(batch_states[index][state_indexes[index]])
@@ -267,9 +267,13 @@ class Simulator:
                             target_log_probs[index][ev_token] = target_log_probs[index][ev_token] + math.log(factor)
                         row_log_sum = torch.logsumexp(target_log_probs[index], dim=0)
                         target_log_probs[index] = target_log_probs[index] - row_log_sum
-
                     player_tokens = torch.argwhere((tokens <= 28) & (tokens >= 17)).squeeze()
                     state_indexes[player_tokens] += 1
+                hard_token_indexes = torch.argwhere((tokens < 9) | ((tokens < self.min_size_token) | (tokens > 13))).squeeze()
+                for index in hard_token_indexes:
+                    target_log_probs[index][tokens[index]] += max(math.log(1.0 + shift_cap), 1e-6)
+                    row_log_sum = torch.logsumexp(target_log_probs[index], dim=0)
+                    target_log_probs[index] = target_log_probs[index] - row_log_sum
                 loss = self.loss(base_logits, target_log_probs)
 
                 losses.append(loss.item())
@@ -285,8 +289,8 @@ class Simulator:
             self.optimizer.step()
             self.optimizer.zero_grad()
             ttl_loss = torch.zeros(1).to(self.device)
-            if itr % 1000 == 0:
-                torch.save(self.model.state_dict(), "RL-" + str(itr) + "-" + str(mean_loss)[:5] + ".pt")
+            if itr % 100 == 0:
+                torch.save(self.model.state_dict(), "RL-" + str(itr) + "-" + str(mean_loss)[-3:] + ".pt")
 
 
 
