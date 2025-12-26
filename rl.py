@@ -50,11 +50,8 @@ class Simulator:
     def rl(self):
         losses = []
         shift_cap = 0.05
-        # 1. Use an accumulation variable for the loss, not a single tensor
         ttl_loss = 0
         batch_size = 16
-
-        # Accumulate gradients over multiple batches to stabilize training
         accumulation_steps = 4
 
         for itr in range(0, 50000):
@@ -62,7 +59,6 @@ class Simulator:
             batch_states = []
             players = []
 
-            # --- SIMULATION STEP (Unchanged) ---
             for i in range(batch_size):
                 player = randint(0, 5)
                 players.append(player)
@@ -71,12 +67,6 @@ class Simulator:
                     states = []
                     while not hand.done:
                         hand_copy = copy.deepcopy(hand)
-                        """
-                        if hand.state.turn_index == player:
-                            self.model = self.new_model
-                        else:
-                            self.model = self.original_model
-                        """
                         action, size = self.select_action(hand)
                         states.append(hand_copy)
                         match action:
@@ -88,72 +78,43 @@ class Simulator:
                                 hand.call()
                             case 'raise':
                                 hand.bet_or_raise(size)
-                    print(hand.u_hand) # Optional: reduce print spam
+                    print(hand.u_hand)
                     uh = hand.get_u_hand(player)
                     print(uh)
                     batch_states.append(states)
                     batch.append(self.encoder.encode(json.dumps(uh), True))
 
-            # Prepare Batch
             batch_tensor = torch.tensor(self.tokenizer(batch, padding="max_length", max_length=128).input_ids).to(self.device)
             hero_ids = batch_tensor[:, 1]
             state_indexes = torch.zeros(batch_tensor.shape[0], dtype=torch.int).to(self.device).detach()
             last_hero_tokens = torch.tensor([]).to(self.device)
 
-            # Initialize batch loss
             current_batch_loss = torch.tensor(0.0).to(self.device)
             valid_loss_steps = 0  # Count how many tokens we actually trained on
-
-            # Iterate through sequence
             for i in range(1, 128):
                 tokens = batch_tensor[:, i]
                 subslice = batch_tensor[:, :i]
-
-                # Get raw logits from the model
                 logits = self.new_model(subslice).logits[:, -1, :]
-
-                # Calculate Log Softmax (Base Probs)
                 base_log_probs = torch.log_softmax(logits, dim=1)
-
-                # Identify which rows in the batch correspond to the Hero's turn
                 hero_tokens = torch.argwhere(hero_ids == tokens).squeeze()
-
-                # Initialize a mask: Default is False (DO NOT TRAIN)
                 train_mask = torch.zeros(batch_tensor.shape[0], dtype=torch.bool).to(self.device)
-
                 if i > 26:
-                    # Logic to identify if this specific token is an Action (Fold/Call/Raise/Check)
                     action_token_indexes = torch.argwhere((tokens <= 13) & (tokens >= 9)).squeeze()
 
                     if action_token_indexes.ndim == 0 and action_token_indexes.numel() == 1:
                         action_token_indexes = action_token_indexes.unsqueeze(0)
                     elif action_token_indexes.numel() == 0:
                         action_token_indexes = torch.tensor([]).to(self.device)
-
-                    # Intersection: Rows where it is Hero's turn AND the token is an Action
-                    # Note: Ensure last_hero_tokens is on the same device and compatible
                     if last_hero_tokens.numel() > 0:
                         hero_action_indexes = action_token_indexes[torch.isin(action_token_indexes, last_hero_tokens)]
                     else:
                         hero_action_indexes = torch.tensor([], dtype=torch.long).to(self.device)
-
-                    # Create targets ONLY for the rows where we have an EV update
                     target_log_probs = base_log_probs.clone().detach()
 
                     for index in hero_action_indexes:
-                        # Mark this row as valid for training
                         train_mask[index] = True
-
-                        # Fetch EV
                         evs = self.generate_action_evs(batch_states[index][state_indexes[index]])
-
-                        # --- FIX 1: LINEAR SPACE RENORMALIZATION ---
-                        # Instead of adding logs, we multiply probabilities.
-                        # This guarantees the result sums to 1.0 (valid distribution).
-
-                        probs = torch.exp(target_log_probs[index])  # Convert log-probs to linear probs
-
-                        # Calculate Scaling Factors
+                        probs = torch.exp(target_log_probs[index])
                         max_ev = 0
                         for ev_token in evs.keys():
                             abs_ev = abs(evs[ev_token])
@@ -163,8 +124,6 @@ class Simulator:
                         key_len = len(keys)
                         ttl = 0
                         temp_evs = {}
-
-                        # Normalize EVs relative to Max
                         for ev_token in keys:
                             adj = evs[ev_token] / max_ev if max_ev != 0 else 0
                             temp_evs[ev_token] = adj
@@ -172,57 +131,31 @@ class Simulator:
 
                         mean = ttl / key_len
 
-                        # Apply shifts to Linear Probabilities
                         for ev_token in keys:
                             adj_ev = temp_evs[ev_token] - mean
                             factor = 1.0 + (shift_cap * adj_ev)
-                            factor = max(factor, 1e-6)  # Safety floor
-
-                            # Update Probability: P_new = P_old * Factor
+                            factor = max(factor, 1e-6)
                             probs[ev_token] = probs[ev_token] * factor
-
-                        # Re-Normalize strictly to ensure Sum(P) == 1.0
                         probs = probs / torch.sum(probs)
-
-                        # Convert back to Log Space safely
                         target_log_probs[index] = torch.log(probs + 1e-9)  # Epsilon for safety
-
-                    # Update state indexes
                     player_tokens = torch.argwhere((tokens <= 28) & (tokens >= 17)).squeeze()
                     if player_tokens.numel() > 0:
                         state_indexes[player_tokens] += 1
-
-                    # --- FIX 2: MASKED LOSS CALCULATION ---
                     if train_mask.any():
-                        # Calculate KLDiv only on the rows where we modified the target (Hero Actions)
-                        # We slice [train_mask] to select only the relevant batch rows
                         loss = self.loss(base_log_probs[train_mask], target_log_probs[train_mask])
-
                         current_batch_loss += loss
                         valid_loss_steps += 1
                         losses.append(loss.item())
-
-                # Update context
                 last_hero_tokens = hero_tokens
-
-            # --- OPTIMIZATION STEP ---
-            # Only step if we actually calculated loss this batch
             if valid_loss_steps > 0:
-                # Normalize loss by number of valid steps to keep gradients consistent
                 final_loss = current_batch_loss / valid_loss_steps
                 final_loss.backward()
-
-                # Gradient Accumulation Logic (Optional but recommended for small batch sizes)
                 if (itr + 1) % accumulation_steps == 0:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-
-                # Reporting
                 mean_loss = np.mean(losses) if losses else 0
                 print(f"Itr {itr} | Mean Loss: {mean_loss:.6f}")
                 losses = []
-
-            # Save Checkpoint
             if itr % 100 == 0 and itr > 0:
                 torch.save(self.model.state_dict(), f"RL-{itr}.pt")
 
