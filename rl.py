@@ -269,11 +269,13 @@ class Simulator:
                         target_log_probs[index] = target_log_probs[index] - row_log_sum
                     player_tokens = torch.argwhere((tokens <= 28) & (tokens >= 17)).squeeze()
                     state_indexes[player_tokens] += 1
+                """
                 hard_token_indexes = torch.argwhere((tokens < 9) | ((tokens < self.min_size_token) | (tokens > 13))).squeeze()
                 for index in hard_token_indexes:
                     target_log_probs[index][tokens[index]] += max(math.log(1.0 + shift_cap), 1e-6)
                     row_log_sum = torch.logsumexp(target_log_probs[index], dim=0)
                     target_log_probs[index] = target_log_probs[index] - row_log_sum
+                """
                 loss = self.loss(base_logits, target_log_probs)
 
                 losses.append(loss.item())
