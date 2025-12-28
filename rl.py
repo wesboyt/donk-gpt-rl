@@ -260,7 +260,7 @@ class Simulator:
                         tax =  min(payoff[j] * .05, 2 * hand.big_blind)
                         payoff[j] -= tax
                     elif payoff[j] == 0:
-                        payoff[j] = -.025 * hand.big_blind * 6 - j
+                        payoff[j] = -.025 * hand.big_blind * (6 - j)
 
                 payoffs.append(payoff)
             return payoffs
