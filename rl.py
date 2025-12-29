@@ -141,12 +141,14 @@ class Simulator:
                                 adj_ev = temp_evs[ev_token] - mean
                                 weight = pcts[ev_token]
                                 if weight > 0.03:
+                                    """
                                     pot_size = hero_state.pot_size()
                                     if ev_token == self.fold_token:
                                         call_size = action_space['call']
                                         pot_odds = call_size / (pot_size + call_size)
                                         if equity > pot_odds:
                                             adj_ev = -1
+                                    """
                                     factor = 1.0 + (shift_cap * adj_ev)
                                     factor = max(factor, 1e-6)
                                     probs[ev_token] = probs[ev_token] * factor
@@ -259,8 +261,10 @@ class Simulator:
                     if payoff[j] > 0:
                         tax =  min(payoff[j] * .05, 2 * hand.big_blind)
                         payoff[j] -= tax
+                    """
                     elif payoff[j] == 0:
                         payoff[j] = -.025 * hand.big_blind * (6 - j)
+                    """
 
                 payoffs.append(payoff)
             return payoffs
