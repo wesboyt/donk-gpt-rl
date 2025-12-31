@@ -89,10 +89,10 @@ class Simulator:
             last_result_tokens = torch.argwhere(tokens == self.result_token).squeeze()
             current_batch_loss = torch.tensor(0.0).to(self.device)
             valid_loss_steps = 0
+            batch_logits = self.new_model(batch_tensor).logits
             for i in range(1, 128):
                 tokens = batch_tensor[:, i]
-                subslice = batch_tensor[:, :i]
-                logits = self.new_model(subslice).logits[:, -1, :]
+                logits = batch_logits[:, i-1, :]
                 base_log_probs = torch.log_softmax(logits, dim=1)
                 hero_tokens = torch.argwhere(hero_ids == tokens).squeeze()
                 result_tokens = torch.argwhere(tokens == self.result_token.item()).squeeze()
