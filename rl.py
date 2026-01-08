@@ -46,12 +46,11 @@ class Simulator:
 
         for i in range(86):
             self.id_to_str.append(self.tokenizer.decode(i))
-    def rl(self):
-        losses = []
-        shift_cap = 0.05
-        batch_size = 8
-        accumulation_steps = 1
 
+        def rl(self):
+        losses = []
+        shift_cap = 0.15
+        batch_size = 32
         for itr in range(0, 5000000):
             batch = []
             batch_states = []
@@ -82,25 +81,25 @@ class Simulator:
                     batch_states.append(states)
                     batch.append(self.encoder.encode(json.dumps(uh), True))
             batch_tensor = torch.tensor(self.tokenizer(batch, padding="max_length", max_length=128).input_ids).to(self.device)
+            #with torch.no_grad():
+                #batch_ref_logits = self.ref_model(batch_tensor).logits
             hero_ids = batch_tensor[:, 1]
             state_indexes = torch.zeros(batch_tensor.shape[0], dtype=torch.int).to(self.device).detach()
             tokens = batch_tensor[:, 0]
             last_hero_tokens = torch.argwhere(hero_ids == tokens).squeeze()
-            last_result_tokens = torch.argwhere(tokens == self.result_token).squeeze()
             current_batch_loss = torch.tensor(0.0).to(self.device)
-            valid_loss_steps = 0
             batch_logits = self.new_model(batch_tensor).logits
             for i in range(1, 128):
                 tokens = batch_tensor[:, i]
                 logits = batch_logits[:, i-1, :]
+                #ref_logits = batch_ref_logits[:, i-1, :]
                 base_log_probs = torch.log_softmax(logits, dim=1)
+                #ref_log_probs = torch.log_softmax(ref_logits, dim=1)
                 hero_tokens = torch.argwhere(hero_ids == tokens).squeeze()
-                result_tokens = torch.argwhere(tokens == self.result_token.item()).squeeze()
-                if result_tokens.ndim == 0 and result_tokens.numel() == 1:
-                    result_tokens = result_tokens.unsqueeze(0)
-                elif result_tokens.numel() == 0:
-                    result_tokens = torch.tensor([]).to(self.device)
                 train_mask = torch.zeros(batch_tensor.shape[0], dtype=torch.bool).to(self.device)
+                #lm_labels = tokens.clone()
+                #kl_penalty = torch.nn.functional.kl_div(base_log_probs, ref_log_probs, log_target=True, reduction='batchmean')
+                #current_batch_loss += 0.0000005 * kl_penalty
 
                 if i > 26:
                     action_token_indexes = torch.argwhere((tokens <= 13) & (tokens >= 9)).squeeze()
@@ -119,7 +118,7 @@ class Simulator:
                             hero = hero_state.state.turn_index
                             train_mask[index] = True
                             evs = self.generate_action_evs(hero_state)
-                            equity = hero_state.equity()[hero]
+                            #equity = hero_state.equity()[hero]
                             probs = torch.exp(target_log_probs[index])
                             max_ev = 0
                             for ev_token in evs.keys():
@@ -127,16 +126,18 @@ class Simulator:
                                 if abs_ev > max_ev: max_ev = abs_ev
 
                             keys = list(evs.keys())
-                            key_len = len(keys)
-                            ttl = 0
+                            #key_len = len(keys)
+                            mean = 0
+                            pcts = probs.softmax(dim=0)
                             temp_evs = {}
                             for ev_token in keys:
-                                adj = evs[ev_token] / max_ev if max_ev != 0 else 0
+                                #adj = evs[ev_token] / max_ev if max_ev != 0 else 0
+                                adj = evs[ev_token] #/ (50 * hand.big_blind)
                                 temp_evs[ev_token] = adj
-                                ttl += adj
-                            mean = ttl / key_len
-                            pcts = probs.softmax(dim=0)
-                            action_space = hero_state.get_action_space()
+                                mean += adj * pcts[ev_token]
+                            #mean = ttl / key_len
+
+                            #action_space = hero_state.get_action_space()
                             for ev_token in keys:
                                 adj_ev = temp_evs[ev_token] - mean
                                 weight = pcts[ev_token]
@@ -160,30 +161,19 @@ class Simulator:
                     if player_tokens.numel() > 0:
                         state_indexes[player_tokens] += 1
 
-                    if last_result_tokens.numel() > 0:
-                        for index in last_result_tokens:
-                            token = tokens[index]
-                            train_mask[index] = True
-                            probs = torch.exp(target_log_probs[index])
-                            probs[token] = probs[token] * 1.02
-                            probs = probs / torch.sum(probs)
-                            target_log_probs[index] = torch.log(probs + 1e-9)
                     if train_mask.any():
                         loss = self.loss(base_log_probs[train_mask], target_log_probs[train_mask])
                         current_batch_loss += loss
-                        valid_loss_steps += 1
                         losses.append(loss.item())
+                #lm_labels[train_mask] = -100
+                #current_batch_loss += 0.0000001 * self.lm_loss_fct(logits, lm_labels)
                 last_hero_tokens = hero_tokens
-                last_result_tokens = result_tokens
-            if valid_loss_steps > 0:
-                final_loss = current_batch_loss / valid_loss_steps
-                final_loss.backward()
-                if (itr + 1) % accumulation_steps == 0:
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                mean_loss = np.mean(losses) if losses else 0
-                print(f"Itr {itr} | Mean Loss: {mean_loss:.6f}")
-                losses = []
+            current_batch_loss.backward()
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            mean_loss = np.mean(losses) if losses else 0
+            print(f"Itr {itr} | Mean Loss: {mean_loss:.6f}")
+            losses = []
             if itr % 100 == 0 and itr > 0:
                 torch.save(self.model.state_dict(), f"RL-{itr}.pt")
 
