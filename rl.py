@@ -68,44 +68,62 @@ class Simulator:
                 cumulative = 0.0
                 selected = False
                 valid_probs = {}
-                if 'min_bet' in action_space: valid_probs['raise'] = raise_probs[i].item()
+                if 'min_bet' in action_space:
+                    valid_probs['raise'] = raise_probs[i].item()
+                    valid_probs['allin'] = allin_probs[i].item()
                 if 'call' in action_space: valid_probs['call'] = call_probs[i].item()
                 if 'fold' in action_space: valid_probs['fold'] = fold_probs[i].item()
                 if 'check' in action_space: valid_probs['check'] = check_probs[i].item()
+
                 total_p = sum(valid_probs.values())
                 if total_p == 0: total_p = 1e-9
+
+                # Selection Loop
+                # Check Raise
                 if 'raise' in valid_probs:
                     prob = valid_probs['raise'] / total_p
                     cumulative += prob
                     if cumulative >= roll:
-                        actions[i] = ('raise', 0)
+                        actions[i] = ('raise', 0)  # Placeholder size
                         raise_indices.append(i)
                         selected = True
+
+                # Check Call
                 if not selected and 'call' in valid_probs:
                     prob = valid_probs['call'] / total_p
                     cumulative += prob
                     if cumulative >= roll:
+                        # Logic for effective stack shoving
                         eff_stack = hnd.state.get_effective_stack(hnd.state.turn_index)
                         is_shove = False
+                        # Simple heuristic check for all-in call based on your original code
                         if eff_stack == hnd.state.checking_or_calling_amount:
+                            # Check if model wants to all-in token (contextual)
+                            # Kept simple here to preserve flow
                             pass
                         actions[i] = ('call', hnd.state.checking_or_calling_amount)
                         selected = True
+
+                # Check Fold
                 if not selected and 'fold' in valid_probs:
                     prob = valid_probs['fold'] / total_p
                     cumulative += prob
                     if cumulative >= roll:
                         actions[i] = ('fold', 0)
                         selected = True
+
+                # Check Check
                 if not selected and 'check' in valid_probs:
                     prob = valid_probs['check'] / total_p
                     cumulative += prob
                     if cumulative >= roll:
                         actions[i] = ('check', 0)
                         selected = True
+
+                # Fallback
                 if not selected:
-                    if 'check' in action_space:
-                        actions[i] = ('check', 0)
+                    if 'max_bet' in action_space:
+                        actions[i] = ('raise', action_space['max_bet'])
                     else:
                         actions[i] = ('call', hnd.state.checking_or_calling_amount)
             if raise_indices:
