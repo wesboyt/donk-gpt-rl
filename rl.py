@@ -41,7 +41,7 @@ class Simulator:
         self.torch_sizes_float = self.torch_sizes.float()
         self.encoder = Encoder()
         self.loss = torch.nn.KLDivLoss(reduction="batchmean", log_target=True).to(self.device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6)
         torch.autograd.set_detect_anomaly(True)
 
         for i in range(86):
