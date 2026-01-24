@@ -345,7 +345,6 @@ class Simulator:
                 base_log_probs = torch.log_softmax(logits, dim=1)
                 hero_tokens = torch.argwhere(hero_ids == tokens).squeeze()
                 train_mask = torch.zeros(batch_tensor.shape[0], dtype=torch.bool).to(self.device)
-
                 if i > 26:
                     action_token_indexes = torch.argwhere((tokens <= 13) & (tokens >= 9)).squeeze()
                     if action_token_indexes.ndim == 0 and action_token_indexes.numel() == 1:
@@ -357,7 +356,6 @@ class Simulator:
                     else:
                         hero_action_indexes = torch.tensor([], dtype=torch.long).to(self.device)
                     target_log_probs = base_log_probs.clone().detach()
-
                     if hero_action_indexes.numel() > 0:
                         for index in hero_action_indexes:
                             if flop_mask[index]:
@@ -366,26 +364,33 @@ class Simulator:
                                 train_mask[index] = True
                                 with torch.no_grad():
                                     evs = self.generate_action_evs(hero_state)
-                                # equity = hero_state.equity()[hero]
                                 probs = torch.exp(target_log_probs[index])
                                 max_ev = 0
                                 for ev_token in evs.keys():
                                     abs_ev = abs(evs[ev_token][0])
                                     if abs_ev > max_ev: max_ev = abs_ev
-
                                 keys = list(evs.keys())
-                                # key_len = len(keys)
-                                mean = 0
+                                mean_ev = 0
+                                mean_risk = 0
                                 pcts = probs.softmax(dim=0)
                                 ttl_pct = 0
+                                max_ev_dist = 0
                                 for ev_token in keys:
                                     ttl_pct += pcts[ev_token].item()
                                 for ev_token in keys:
-                                    mean += evs[ev_token][0] * (pcts[ev_token] / ttl_pct)
-
+                                    lklhood = (pcts[ev_token] / ttl_pct)
+                                    mean_ev += evs[ev_token][0] * lklhood
+                                    mean_risk += evs[ev_token][1] * lklhood
+                                if mean_risk < 1.0:
+                                    mean_risk = 1.0
                                 for ev_token in keys:
-                                    adj_ev = (evs[ev_token][0] - mean) / evs[ev_token][1]
-                                    factor = 1.0 + adj_ev #* shift_cap
+                                    adv = (evs[ev_token][0] - mean_ev) / mean_risk
+                                    evs[ev_token][0] = adv
+                                    if adv > max_ev_dist:
+                                        max_ev_dist = adv
+                                for ev_token in keys:
+                                    adj_ev = evs[ev_token][0] / max_ev_dist
+                                    factor = 1.0 + adj_ev * shift_cap
                                     factor = max(factor, 1e-6)
                                     probs[ev_token] = probs[ev_token] * factor
                                 probs = probs / torch.sum(probs)
@@ -393,9 +398,7 @@ class Simulator:
                     player_tokens = torch.argwhere((tokens <= 28) & (tokens >= 17)).squeeze()
                     if player_tokens.numel() > 0:
                         state_indexes[player_tokens] += 1
-
                     final_mask = train_mask & flop_mask
-
                     if final_mask.any():
                         loss = self.loss(base_log_probs[final_mask], target_log_probs[final_mask])
                         current_batch_loss += loss
