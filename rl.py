@@ -360,41 +360,29 @@ class Simulator:
                         for index in hero_action_indexes:
                             if flop_mask[index]:
                                 hero_state = batch_states[index][state_indexes[index]]
-                                hero = hero_state.state.turn_index
                                 train_mask[index] = True
                                 with torch.no_grad():
                                     evs = self.generate_action_evs(hero_state)
-                                probs = torch.exp(target_log_probs[index])
-                                max_ev = 0
-                                for ev_token in evs.keys():
-                                    abs_ev = abs(evs[ev_token][0])
-                                    if abs_ev > max_ev: max_ev = abs_ev
-                                keys = list(evs.keys())
-                                mean_ev = 0
-                                mean_risk = 0
-                                pcts = probs.softmax(dim=0)
-                                ttl_pct = 0
-                                max_ev_dist = 0
-                                for ev_token in keys:
-                                    ttl_pct += pcts[ev_token].item()
-                                for ev_token in keys:
-                                    lklhood = (pcts[ev_token] / ttl_pct)
-                                    mean_ev += evs[ev_token][0] * lklhood
-                                    mean_risk += evs[ev_token][1] * lklhood
-                                if mean_risk < 1.0:
-                                    mean_risk = 1.0
-                                for ev_token in keys:
-                                    adv = (evs[ev_token][0] - mean_ev) / mean_risk
-                                    evs[ev_token][0] = adv
-                                    if adv > max_ev_dist:
-                                        max_ev_dist = adv
-                                for ev_token in keys:
-                                    adj_ev = evs[ev_token][0] / max_ev_dist
-                                    factor = 1.0 + adj_ev * shift_cap
-                                    factor = max(factor, 1e-6)
-                                    probs[ev_token] = probs[ev_token] * factor
-                                probs = probs / torch.sum(probs)
-                                target_log_probs[index] = torch.log(probs + 1e-9)
+                                valid_tokens = list(evs.keys())
+                                if not valid_tokens: continue
+                                current_logits = base_log_probs[index].clone()
+                                valid_action_log_probs = current_logits[valid_tokens]
+                                local_probs = torch.softmax(valid_action_log_probs, dim=0)
+                                mean_ev = 0.0
+                                mean_risk = 0.0
+                                for i, token in enumerate(valid_tokens):
+                                    weight = local_probs[i].item()
+                                    mean_ev += evs[token][0] * weight
+                                    mean_risk += evs[token][1] * weight
+                                mean_risk = max(mean_risk, 1.0)
+                                for token in valid_tokens:
+                                    raw_advantage = evs[token][0] - mean_ev
+                                    risk_scaled_shift = raw_advantage / mean_risk
+                                    final_shift = max(min(risk_scaled_shift, shift_cap), -shift_cap)
+                                    current_prob = torch.exp(current_logits[token])
+                                    target_prob = current_prob * (1.0 + final_shift)
+                                    current_logits[token] = torch.log(target_prob + 1e-12)
+                                target_log_probs[index] = torch.log_softmax(current_logits, dim=0)
                     player_tokens = torch.argwhere((tokens <= 28) & (tokens >= 17)).squeeze()
                     if player_tokens.numel() > 0:
                         state_indexes[player_tokens] += 1
