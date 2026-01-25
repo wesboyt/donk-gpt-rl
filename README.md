@@ -11,3 +11,9 @@ This RL suite processes approximately 120k simulations per hour on a 3090 utiliz
 It represents the culmination of 6000 hours of research into game theory and poker(beginning in 2019) and is able to beat the bot collusion rings online by over 4bb/100 upto 200nl.
 
 The models involved are accessible from donkgpt.com where you can submit a handhistory with an approved account and payment to receive truly gto multiway solutions that generalize to any gametree and betting structure.
+
+<img width="181" height="198" alt="image" src="https://github.com/user-attachments/assets/c4ea5a05-7302-41e3-b043-e38cf37e44a0" />
+
+This is what output action spaces look like after 180k simulations:
+<img width="584" height="468" alt="image" src="https://github.com/user-attachments/assets/9f82484c-0bc0-4652-975a-c56931d9e670" />
+
