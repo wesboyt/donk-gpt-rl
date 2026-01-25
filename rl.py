@@ -375,9 +375,9 @@ class Simulator:
                                     mean_ev += evs[token][0] * weight
                                     mean_risk += evs[token][1] * weight
                                 mean_risk = max(mean_risk, 1.0)
+                                mean_efficiency = mean_ev / mean_risk
                                 for token in valid_tokens:
-                                    raw_advantage = evs[token][0] - mean_ev
-                                    risk_scaled_shift = raw_advantage / mean_risk
+                                    risk_scaled_shift = evs[token][0] / max(evs[token][1], 1.0) - mean_efficiency
                                     final_shift = max(min(risk_scaled_shift, shift_cap), -shift_cap)
                                     current_prob = torch.exp(current_logits[token])
                                     target_prob = current_prob * (1.0 + final_shift)
