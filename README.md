@@ -19,6 +19,7 @@ This is what output action spaces look like after 180k simulations:
 
 Here is the increase in ev verse the pretrained model after 180k simulations sbvbb:
 <img width="486" height="229" alt="image" src="https://github.com/user-attachments/assets/73ba5a32-58b2-4065-8711-4e46a95479d3" />
-negative means rl model winning, positive means pretrained model winning.
+
+negative means rl model winning, positive means pretrained model winning, these compare performance from the exact same position with the exact same cards.
 
 
