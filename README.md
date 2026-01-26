@@ -22,6 +22,6 @@ Here is the increase in ev verse the pretrained model after 180k simulations sbv
 
 negative means rl model winning, positive means pretrained model winning. 
 
-these compare performance from the exact same position with the exact same cards.
+these compare performance from the exact same position with the exact same cards, each line is 1k different hands sampled 100 times each for both models.
 
 
