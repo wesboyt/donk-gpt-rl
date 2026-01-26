@@ -49,14 +49,14 @@ class Simulator:
             villain_model=self.model_b,
             hero_index=hero_index,
             n_sims=n_sims
-        )
+        ) / gamestate.big_blind
         ev_b = self._simulate_rollout_ev(
             gamestate,
             hero_model=self.model_b,
             villain_model=self.model_a,
             hero_index=hero_index,
             n_sims=n_sims
-        )
+        ) / gamestate.big_blind
 
         return (ev_a, ev_b)
 
