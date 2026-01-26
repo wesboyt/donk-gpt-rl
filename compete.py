@@ -191,4 +191,4 @@ if __name__ == '__main__':
             hand.fold()
         result = sim.compare_strategies(hand,100)
         results.append(result[0] - result[1])
-    print(np.mean(results), np.std(results))
+    print("mean:", np.mean(results), "std:", np.std(results))
