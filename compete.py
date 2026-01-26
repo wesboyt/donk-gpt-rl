@@ -42,11 +42,6 @@ class Simulator:
 
 
     def compare_strategies(self, gamestate, n_sims=100):
-        """
-        Main entry point.
-        Takes a gamestate and compares Model A vs Model B.
-        Returns: tuple(EV_Model_A, EV_Model_B)
-        """
         hero_index = gamestate.state.turn_index
         ev_a = self._simulate_rollout_ev(
             gamestate,
@@ -66,9 +61,6 @@ class Simulator:
         return (ev_a, ev_b)
 
     def _simulate_rollout_ev(self, gamestate, hero_model, villain_model, hero_index, n_sims):
-        """
-        Runs Monte Carlo simulations for a specific matchup configuration.
-        """
         total_payoff = 0.0
 
         for _ in range(n_sims):
