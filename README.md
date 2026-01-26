@@ -17,9 +17,11 @@ The models involved are accessible from donkgpt.com where you can submit a handh
 This is what output action spaces look like after 180k simulations:
 <img width="584" height="468" alt="image" src="https://github.com/user-attachments/assets/9f82484c-0bc0-4652-975a-c56931d9e670" />
 
-Here is the increase in ev verse the pretrained model after 180k simulations sbvbb:
+Here is the increase in ev verse the pretrained model after 180k simulations sbvbb, numbers in bigblinds:
 <img width="538" height="288" alt="image" src="https://github.com/user-attachments/assets/1f04ff66-30a8-46c2-ab8e-b3148d458ce6" />
 
-negative means rl model winning, positive means pretrained model winning, these compare performance from the exact same position with the exact same cards.
+negative means rl model winning, positive means pretrained model winning. 
+
+these compare performance from the exact same position with the exact same cards.
 
 
