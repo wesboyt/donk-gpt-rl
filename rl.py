@@ -332,11 +332,14 @@ class Simulator:
                         hnd_count += 1
             batch_tensor = torch.tensor(self.tokenizer(batch, padding=True).input_ids).to(self.device)
             hero_ids = batch_tensor[:, 1]
-            state_indexes = torch.zeros(batch_tensor.shape[0], dtype=torch.int).to(self.device).detach()
+            state_indexes = torch.full((batch_tensor.shape[0],), -1, dtype=torch.int).to(self.device)
+            first_col_tokens = batch_tensor[:, 0]
+            first_col_is_player = (first_col_tokens <= 28) & (first_col_tokens >= 17)
+            state_indexes[first_col_is_player] = 0
             tokens = batch_tensor[:, 0]
             last_hero_tokens = torch.argwhere(hero_ids == tokens).squeeze()
             current_batch_loss = torch.tensor(0.0).to(self.device)
-            batch_logits = self.new_model(batch_tensor).logits
+            batch_logits = self.model(batch_tensor).logits
             flop_mask = torch.zeros(batch_tensor.shape[0], dtype=torch.bool).to(self.device)
             should_be_loss = False
             for i in range(1, batch_tensor.shape[1]):
