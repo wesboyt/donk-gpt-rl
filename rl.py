@@ -47,6 +47,10 @@ class Simulator:
         for i in range(86):
             self.id_to_str.append(self.tokenizer.decode(i))
 
+        self.encoder = Encoder()
+        self.loss = torch.nn.KLDivLoss(reduction="batchmean", log_target=True).to(self.device)
+        self.optimizer = schedulefree.AdamWScheduleFree(self.model.parameters(), lr=1e-6)
+        self.optimizer.train()
 
     def calc_investment(self, u_hand, player):
         invested = 0
@@ -103,8 +107,6 @@ class Simulator:
                     prob = valid_probs['call'] / total_p
                     cumulative += prob
                     if cumulative >= roll:
-                        eff_stack = hnd.state.get_effective_stack(hnd.state.turn_index)
-                        is_shove = False
                         actions[i] = ('call', hnd.state.checking_or_calling_amount)
                         selected = True
                 if not selected and 'fold' in valid_probs:
@@ -124,12 +126,15 @@ class Simulator:
                         actions[i] = ('raise', action_space['max_bet'])
                     else:
                         actions[i] = ('call', hnd.state.checking_or_calling_amount)
+
             if raise_indices:
                 raiser_tokens = batch_tokens[raise_indices]
                 raise_suffix = torch.full((len(raise_indices), 1), self.raise_token.item(), device=self.device)
                 raise_inputs = torch.cat([raiser_tokens, raise_suffix], dim=1)
+
                 raise_logits = self.model(raise_inputs).logits[:, -1, :]
                 raise_probs = torch.softmax(raise_logits, dim=1)
+
                 min_bet_idx = self.min_size_token.item()
                 size_probs = raise_probs[:, min_bet_idx: min_bet_idx + len(self.sizes)]
                 size_probs = size_probs / (size_probs.sum(dim=1, keepdim=True) + 1e-9)
@@ -179,11 +184,11 @@ class Simulator:
             active_indices = next_active
 
     def generate_action_evs(self, ohand):
-        #Generates EVs by running ALL counterfactual simulations in one large batch.
         player = ohand.state.turn_index
         action_space = ohand.get_action_space()
         scenarios = []
         n_sims = 32
+
         def setup_sim(action_type):
             for _ in range(n_sims):
                 h = copy.deepcopy(ohand)
@@ -197,56 +202,46 @@ class Simulator:
                 elif action_type == 'raise':
                     size = self.select_raise(h)
                     h.bet_or_raise(size)
-                if not h.done:
-                    scenarios.append(h)
-                else:
-                    scenarios.append(h)
+                scenarios.append(h)
+
         tokens_map = {}
 
         if 'fold' in action_space:
-            start_idx = len(scenarios)
+            start = len(scenarios)
             setup_sim('fold')
-            tokens_map[self.fold_token.item()] = list(range(start_idx, len(scenarios)))
+            tokens_map[self.fold_token.item()] = list(range(start, len(scenarios)))
 
         if 'check' in action_space:
-            start_idx = len(scenarios)
+            start = len(scenarios)
             setup_sim('check')
-            tokens_map[self.check_token.item()] = list(range(start_idx, len(scenarios)))
+            tokens_map[self.check_token.item()] = list(range(start, len(scenarios)))
 
         if 'call' in action_space:
-            start_idx = len(scenarios)
+            start = len(scenarios)
             setup_sim('call')
-            tokens_map[self.call_token.item()] = list(range(start_idx, len(scenarios)))
+            tokens_map[self.call_token.item()] = list(range(start, len(scenarios)))
 
         if 'min_bet' in action_space:
-            start_idx = len(scenarios)
+            start = len(scenarios)
             setup_sim('raise')
-            tokens_map[self.raise_token.item()] = list(range(start_idx, len(scenarios)))
-
+            tokens_map[self.raise_token.item()] = list(range(start, len(scenarios)))
         active_hands = [h for h in scenarios if not h.done]
         if active_hands:
             self.simulate_batch(active_hands)
-
         results = {}
         for token, indices in tokens_map.items():
             payoff_sum = 0
-            risk_sum = 0
             count = 0
             for idx in indices:
                 h = scenarios[idx]
                 p = h.state.payoffs[player]
-
                 if p > 0:
                     tax = min(p * .05, 2 * h.big_blind)
                     p -= tax
-                risk = self.calc_investment(h.u_hand, player)
-                if risk < 0:
-                    print('wtf')
-                risk_sum += risk
                 payoff_sum += p
                 count += 1
             if count > 0:
-                results[token] = [payoff_sum / count, risk_sum / count]
+                results[token] = payoff_sum / count
 
         return results
 
@@ -291,8 +286,7 @@ class Simulator:
             return bets, min_bet_token
 
     def select_action(self, hnd):
-        result = self.select_action_batch([hnd])[0]
-        return result
+        return self.select_action_batch([hnd])[0]
 
     def gen_base(self):
         player = randint(0, 5)
@@ -316,38 +310,38 @@ class Simulator:
 
     def rl(self):
         losses = []
-        shift_cap = 0.5
-        batch_size = 32
+        batch_size = 4
+        base_temperature = 1.0
         for itr in range(0, 5000000):
             batch = []
             batch_states = []
             players = []
             hnd_count = 0
             while hnd_count < batch_size:
-                    player, states, uh = self.gen_base()
-                    if len(uh[1]):
-                        players.append(player)
-                        batch_states.append(states)
-                        batch.append(self.encoder.encode(json.dumps(uh), True))
-                        hnd_count += 1
+                player, states, uh = self.gen_base()
+                if len(uh[1]):
+                    players.append(player)
+                    batch_states.append(states)
+                    batch.append(self.encoder.encode(json.dumps(uh), True))
+                    hnd_count += 1
             batch_tensor = torch.tensor(self.tokenizer(batch, padding=True).input_ids).to(self.device)
             hero_ids = batch_tensor[:, 1]
             state_indexes = torch.full((batch_tensor.shape[0],), -1, dtype=torch.int).to(self.device)
             first_col_tokens = batch_tensor[:, 0]
             first_col_is_player = (first_col_tokens <= 28) & (first_col_tokens >= 17)
             state_indexes[first_col_is_player] = 0
-            tokens = batch_tensor[:, 0]
-            last_hero_tokens = torch.argwhere(hero_ids == tokens).squeeze()
+
             current_batch_loss = torch.tensor(0.0).to(self.device)
             batch_logits = self.model(batch_tensor).logits
             flop_mask = torch.zeros(batch_tensor.shape[0], dtype=torch.bool).to(self.device)
             should_be_loss = False
+            last_hero_tokens = torch.argwhere(hero_ids == batch_tensor[:, 0]).squeeze()
+
             for i in range(1, batch_tensor.shape[1]):
                 tokens = batch_tensor[:, i]
                 logits = batch_logits[:, i - 1, :]
-                base_log_probs = torch.log_softmax(logits, dim=1)
+                model_log_probs = torch.log_softmax(logits, dim=1)
                 hero_tokens = torch.argwhere(hero_ids == tokens).squeeze()
-                train_mask = torch.zeros(batch_tensor.shape[0], dtype=torch.bool).to(self.device)
                 if i > 26:
                     action_token_indexes = torch.argwhere((tokens <= 13) & (tokens >= 9)).squeeze()
                     if action_token_indexes.ndim == 0 and action_token_indexes.numel() == 1:
@@ -358,40 +352,32 @@ class Simulator:
                         hero_action_indexes = action_token_indexes[torch.isin(action_token_indexes, last_hero_tokens)]
                     else:
                         hero_action_indexes = torch.tensor([], dtype=torch.long).to(self.device)
-                    target_log_probs = base_log_probs.clone().detach()
+                    target_probs = torch.softmax(logits.detach(), dim=1)
+                    processed_any = False
                     if hero_action_indexes.numel() > 0:
                         for index in hero_action_indexes:
                             if flop_mask[index]:
                                 hero_state = batch_states[index][state_indexes[index]]
-                                train_mask[index] = True
                                 with torch.no_grad():
                                     evs = self.generate_action_evs(hero_state)
                                 valid_tokens = list(evs.keys())
                                 if not valid_tokens: continue
-                                current_logits = base_log_probs[index].clone()
-                                valid_action_log_probs = current_logits[valid_tokens]
-                                local_probs = torch.softmax(valid_action_log_probs, dim=0)
-                                mean_ev = 0.0
-                                mean_risk = 0.0
-                                for i, token in enumerate(valid_tokens):
-                                    weight = local_probs[i].item()
-                                    mean_ev += evs[token][0] * weight
-                                    mean_risk += evs[token][1] * weight
-                                mean_risk = max(mean_risk, 1.0)
-                                mean_efficiency = mean_ev / mean_risk
+                                vals = np.array([evs[t] for t in valid_tokens])
+                                temp = base_temperature * max(hero_state.big_blind, 1.0)
+                                max_val = np.max(vals)
+                                exp_vals = np.exp((vals - max_val) / temp)
+                                dist_probs = exp_vals / np.sum(exp_vals)
                                 for token in valid_tokens:
-                                    risk_scaled_shift = evs[token][0] / max(evs[token][1], 1.0) - mean_efficiency
-                                    final_shift = max(min(risk_scaled_shift, shift_cap), -shift_cap)
-                                    current_prob = torch.exp(current_logits[token])
-                                    target_prob = current_prob * (1.0 + final_shift)
-                                    current_logits[token] = torch.log(target_prob + 1e-12)
-                                target_log_probs[index] = torch.log_softmax(current_logits, dim=0)
+                                    target_probs[index, token] = 0.0
+                                for j, token in enumerate(valid_tokens):
+                                    target_probs[index, token] = max(float(dist_probs[j]), 1e-6)
+                                processed_any = True
                     player_tokens = torch.argwhere((tokens <= 28) & (tokens >= 17)).squeeze()
                     if player_tokens.numel() > 0:
                         state_indexes[player_tokens] += 1
-                    final_mask = train_mask & flop_mask
-                    if final_mask.any():
-                        loss = self.loss(base_log_probs[final_mask], target_log_probs[final_mask])
+                    if processed_any:
+                        target_log_probs = torch.log(target_probs + 1e-9)
+                        loss = self.loss(model_log_probs, target_log_probs)
                         current_batch_loss += loss
                         losses.append(loss.item())
                         should_be_loss = True
@@ -406,7 +392,6 @@ class Simulator:
                 current_batch_loss.backward()
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-
             if itr % 500 == 0 and itr > 0:
                 mean_loss = np.mean(losses) if losses else 0
                 print(f"Itr {itr} | Mean Loss: {mean_loss:.6f}")
@@ -414,8 +399,6 @@ class Simulator:
                 self.optimizer.eval()
                 torch.save(self.model.state_dict(), f"RL-{itr}.pt")
                 self.optimizer.train()
-
-
 if __name__ == '__main__':
-    sim = Simulator('checkpoint-140000')
+    sim = Simulator()
     sim.rl()
