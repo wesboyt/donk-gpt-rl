@@ -310,7 +310,7 @@ class Simulator:
 
     def rl(self):
         losses = []
-        batch_size = 4
+        batch_size = 512
         base_temperature = 1.0
         for itr in range(0, 5000000):
             batch = []
