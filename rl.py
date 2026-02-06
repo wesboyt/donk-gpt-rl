@@ -41,7 +41,7 @@ class Simulator:
         self.encoder = Encoder()
         self.loss = torch.nn.KLDivLoss(reduction="sum", log_target=True).to(self.device)
         self.zero_tensor = torch.tensor(0.0, device=self.device)
-        self.optimizer = schedulefree.AdamWScheduleFree(self.model.parameters(), lr=3e-4)
+        self.optimizer = schedulefree.AdamWScheduleFree(self.model.parameters(), lr=1e-5)
         self.optimizer.train()
 
     def rl(self):
