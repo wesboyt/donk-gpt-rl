@@ -47,7 +47,7 @@ class Simulator:
         self.river_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
 
         # Sizes setup
-        self.sizes = list(range(1, 5)) + list(range(5, 101, 5)) + list(range(125, 501, 25))
+        self.sizes = list(range(1, 5))
         self.sizes = np.int16(self.sizes)
         self.torch_sizes = torch.tensor(self.sizes).to(self.device)
         self.torch_sizes_float = self.torch_sizes.float()
@@ -67,7 +67,6 @@ class Simulator:
         self.batch_queue = queue.Queue(maxsize=8)
         self.stop_event = threading.Event()
         self.global_updates = 0
-        self.gpu_lock = threading.Lock()
 
     def get_local_encoders(self, required_count):
         if not hasattr(self.local_storage, 'encoders'):
