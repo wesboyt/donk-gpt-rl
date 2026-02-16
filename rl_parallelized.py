@@ -27,12 +27,10 @@ class Simulator:
         self.ref_model.eval()
         self.ref_model.requires_grad_(False)
 
-        # Tokenizer setup
         self.tokenizer = AutoTokenizer.from_pretrained('./opt-it-2')
         self.tokenizer.padding_side = "left"
         self.tokenizer.pad_token = self.tokenizer.unk_token
 
-        # Token definitions
         self.result_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
         self.fold_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
         self.check_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
@@ -46,14 +44,12 @@ class Simulator:
         self.turn_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
         self.river_token = torch.tensor(self.tokenizer.encode("<xxx>")).to(self.device)
 
-        # Sizes setup
         self.sizes = list(range(1, 5))
         self.sizes = np.int16(self.sizes)
         self.torch_sizes = torch.tensor(self.sizes).to(self.device)
         self.torch_sizes_float = self.torch_sizes.float()
         self.sizes_floats = np.array(self.torch_sizes_float.tolist(), dtype=np.float32)
 
-        self.encoder = Encoder()
         self.loss = torch.nn.KLDivLoss(reduction="sum", log_target=True).to(self.device)
         self.optimizer = schedulefree.AdamWScheduleFree(self.model.parameters(), lr=1e-5)
         self.optimizer.train()
@@ -61,22 +57,38 @@ class Simulator:
         self.n_sims = 8
         self.batch_size = 8
         self.num_generators = 5
+
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=64)
-        self.local_storage = threading.local()
+
+        self.thread_local = threading.local()
 
         self.batch_queue = queue.Queue(maxsize=8)
         self.stop_event = threading.Event()
         self.global_updates = 0
 
-    def get_local_encoders(self, required_count):
-        if not hasattr(self.local_storage, 'encoders'):
-            self.local_storage.encoders = [Encoder() for _ in range(32)]
-        while len(self.local_storage.encoders) < required_count:
-            self.local_storage.encoders.append(Encoder())
-        return self.local_storage.encoders
+    def get_thread_encoders(self, count):
+        """
+        Returns a list of 'count' encoders unique to the current thread.
+        Creates them if they don't exist.
+        """
+        if not hasattr(self.thread_local, 'encoders'):
+            self.thread_local.encoders = []
+
+        # Grow the pool if needed
+        while len(self.thread_local.encoders) < count:
+            self.thread_local.encoders.append(Encoder())
+
+        return self.thread_local.encoders[:count]
+
+    def get_single_thread_encoder(self):
+        """
+        Returns a single encoder unique to the current thread (for simple encoding).
+        """
+        if not hasattr(self.thread_local, 'single_encoder'):
+            self.thread_local.single_encoder = Encoder()
+        return self.thread_local.single_encoder
 
     def data_generator_worker(self, worker_id):
-
         itr_street_cutoffs = [3, 2, 1, 0]
         hand_street_cutoffs = [5, 4, 3, 0]
 
@@ -87,24 +99,34 @@ class Simulator:
             updates = self.global_updates
             itr_street_index = 0
             if updates > 0:
-                idx = (updates // 2000)
+                idx = (updates // 20000)
                 itr_street_index = min(idx, len(itr_street_cutoffs) - 1)
 
             while len(buffer_text) < self.batch_size and not self.stop_event.is_set():
                 hands, hero_ev_data, hero_indices = self.batch_generate_hands(
-                    3*self.batch_size,
+                    self.batch_size * 2,
                     itr_street_cutoffs[itr_street_index]
                 )
+
+                local_enc = self.get_single_thread_encoder()
 
                 for i, hand in enumerate(hands):
                     if len(hero_ev_data[i]) > 0:
                         hero_idx = hero_indices[i]
                         uh = hand.get_u_hand(hero_idx)
-                        if len(uh[1]) >= hand_street_cutoffs[itr_street_index]:
-                            buffer_text.append(self.encoder.encode(json.dumps(uh), True))
-                            buffer_evs.append(hero_ev_data[i])
 
-                # Cleanup
+                        if not uh[0][hero_idx]:
+                            continue
+
+                        if len(uh[1]) >= hand_street_cutoffs[itr_street_index]:
+                            try:
+                                encoded_str = local_enc.encode(json.dumps(uh), True)
+                                buffer_text.append(encoded_str)
+                                buffer_evs.append(hero_ev_data[i])
+                            except Exception as e:
+                                print(f"Encode error in worker {worker_id}: {e}")
+                                continue
+
                 del hands, hero_ev_data, hero_indices
 
             if self.stop_event.is_set(): break
@@ -142,10 +164,10 @@ class Simulator:
             'allin': self.allin_token.item()
         }
 
-        print(f"Starting Training with {self.num_generators} Generators (Memory Optimized)...")
+        print(f"Starting Training with {self.num_generators} Generators (Thread-Safe)...")
 
         try:
-            while self.global_updates < 8000:
+            while self.global_updates < 80000:
                 try:
                     batch_data = self.batch_queue.get(timeout=300)
                 except queue.Empty:
@@ -219,21 +241,21 @@ class Simulator:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
-                # Manual Deallocation
                 del logits, target_probs, shift_logits, shift_target_probs, loss, final_loss
                 del outputs, ref_outputs, input_ids, attention_mask, hero_ids
-              
+
+                del batch_data, batch_text, batch_hero_evs, inputs
+
                 self.global_updates += 1
-                if self.global_updates % 10 == 0:
+                if self.global_updates % 100 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                if self.global_updates % 1000 == 0:
                     print(f"Update {self.global_updates} | Loss: {np.mean(losses):.6f} | Q: {self.batch_queue.qsize()}")
                     losses = []
-
-                    if self.global_updates % 100 == 0:
-                        # Clear cache occasionally
-                        torch.cuda.empty_cache()
-                        self.model.eval()
-                        torch.save(self.model.state_dict(), f"RL-{self.global_updates}.pt")
-                        self.model.train()
+                    self.model.eval()
+                    torch.save(self.model.state_dict(), f"RL-{self.global_updates}.pt")
+                    self.model.train()
 
         finally:
             self.stop_event.set()
@@ -247,7 +269,6 @@ class Simulator:
 
         while len(active_indices) > 0:
             current_hands = [hands[i] for i in active_indices]
-
             ev_indices = []
             ev_hand_objs = []
             for i, idx in enumerate(active_indices):
@@ -292,19 +313,16 @@ class Simulator:
     def generate_bulk_evs(self, hand_list, size_list):
         all_sims = []
         registry = []
-
         for i, hand in enumerate(hand_list):
             action_space = hand.get_action_space()
             raise_size = size_list[i]
             player = hand.state.turn_index
             res = {}
             if 'fold' in action_space: res['fold'] = -hand.investment()
-
-          registry.append({'holder': res, 'is_calc': False})
+            registry.append({'holder': res, 'is_calc': False})
 
             for root_action in action_space.keys():
                 if root_action == 'fold': continue
-
                 temp_hand = copy.deepcopy(hand)
                 if root_action == 'check':
                     temp_hand.check()
@@ -366,16 +384,16 @@ class Simulator:
                 vals = [finished_payoffs[k][plyr] for k in range(start, start + count)]
                 current_holder[act] = np.mean(vals)
         if current_holder is not None: final_output.append(current_holder)
-
         return final_output
 
     @torch.inference_mode()
     def select_action_batch(self, hands):
         if not hands: return [], []
-        local_encoders = self.get_local_encoders(len(hands))
-        results = list(self.executor.map(self.process_hand_cpu, zip(hands, local_encoders[:len(hands)])))
+        thread_encoders = self.get_thread_encoders(len(hands))
+
+        results = list(self.executor.map(self.process_hand_cpu, zip(hands, thread_encoders[:len(hands)])))
         encoded_strs, min_bet_tokens, max_bets, pot_sizes, can_check, can_raise = zip(*results)
-      
+
         inputs = self.tokenizer(list(encoded_strs), padding=True, return_tensors="pt")
         input_ids = inputs.input_ids.to(self.device, non_blocking=True)
         attention_mask = inputs.attention_mask.to(self.device, non_blocking=True)
@@ -399,11 +417,10 @@ class Simulator:
         probs = torch.softmax(action_logits, dim=1)
         action_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
-        del logits, action_logits, probs, input_ids, attention_mask, inputs
-        del mask_check, mask_raise, actor_tokens
-
         action_tokens_cpu = action_tokens.tolist()
-        del action_tokens
+        
+        del logits, action_logits, probs, input_ids, attention_mask, inputs
+        del mask_check, mask_raise, actor_tokens, action_tokens
 
         is_raise = False
         for tok in action_tokens_cpu:
@@ -465,20 +482,19 @@ class Simulator:
                 for k, hand_idx in enumerate(raise_idxs):
                     final_sizes[hand_idx] = int(min(r_bets_cpu[k], max_bets[hand_idx]))
 
-                del r_inputs, r_ids, r_mask, r_actor, r_raise_tok
-                del r_final_ids, r_ext_mask, r_final_mask, r_logits
-                del size_logits, r_min_tokens, offsets, size_indices, mask, size_probs
-                del r_indices, r_chosen_pct, r_pots, r_bets
+                del r_inputs, r_ids, r_mask, r_actor, r_raise_tok, r_final_ids, r_ext_mask
+                del r_final_mask, r_logits, size_logits, r_min_tokens, offsets, size_indices
+                del mask, size_probs, r_indices, r_chosen_pct, r_pots, r_bets
 
         return final_actions, final_sizes
 
-    @torch.inference_mode()
     def select_raise_batch(self, hands):
         if not hands: return []
-        local_encoders = self.get_local_encoders(len(hands))
-        results = list(self.executor.map(self.process_hand_cpu, zip(hands, local_encoders[:len(hands)])))
-        encoded_strs, min_bet_tokens, max_bets, pot_sizes, _, _ = zip(*results)
 
+        thread_encoders = self.get_thread_encoders(len(hands))
+        results = list(self.executor.map(self.process_hand_cpu, zip(hands, thread_encoders[:len(hands)])))
+        encoded_strs, min_bet_tokens, max_bets, pot_sizes, _, _ = zip(*results)
+        
         inputs = self.tokenizer(list(encoded_strs), padding=True, return_tensors="pt")
         input_ids = inputs.input_ids.to(self.device, non_blocking=True)
         attention_mask = inputs.attention_mask.to(self.device, non_blocking=True)
