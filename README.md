@@ -12,3 +12,4 @@ soft q learning --> kl divergence updates weights to a target of softmax over sa
 
 optimal transport --> Sinkhorn updates loss based on distribution of action space sampled outcomes vs best decision outcomes. Imagine moving piles of dirt between sections of an american football field. how much work was necessary to move the dirt models outcome space to best option outcome space.
 
+weighted cross entropy --> soft q learning with ce instead of kldiv
