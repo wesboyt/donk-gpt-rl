@@ -1,10 +1,6 @@
 import sys
 import os
 import traceback
-
-# -----------------------------------------------------------------------------
-# CRITICAL PRE-IMPORT FIXES
-# -----------------------------------------------------------------------------
 sys.modules["markupsafe._speedups"] = None
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -57,22 +53,22 @@ class Simulator:
 
         hero_ids = []
         for i in range(6):
-            enc = self.tokenizer.encode(f"<herop{i}>")
+            enc = self.tokenizer.encode(f"xxx{i}")
             hero_ids.append(enc[0])
         self.hero_token_ids = torch.tensor(hero_ids, dtype=torch.long, device=self.device)
 
-        self.result_token = torch.tensor(self.tokenizer.encode("<result>")).to(self.device)
-        self.fold_token = torch.tensor(self.tokenizer.encode("<fold>")).to(self.device)
-        self.check_token = torch.tensor(self.tokenizer.encode("<check>")).to(self.device)
-        self.call_token = torch.tensor(self.tokenizer.encode("<call>")).to(self.device)
-        self.raise_token = torch.tensor(self.tokenizer.encode("<raise>")).to(self.device)
+        self.result_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.fold_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.check_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.call_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.raise_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
         self.raise_token_id = self.raise_token.item()
-        self.allin_token = torch.tensor(self.tokenizer.encode("<allin>")).to(self.device)
-        self.min_size_token = torch.tensor(self.tokenizer.encode("<b1%>")).to(self.device)
-        self.preflop_token = torch.tensor(self.tokenizer.encode("<preflop>")).to(self.device)
-        self.flop_token = torch.tensor(self.tokenizer.encode("<flop>")).to(self.device)
-        self.turn_token = torch.tensor(self.tokenizer.encode("<turn>")).to(self.device)
-        self.river_token = torch.tensor(self.tokenizer.encode("<river>")).to(self.device)
+        self.allin_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.min_size_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.preflop_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.flop_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.turn_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
+        self.river_token = torch.tensor(self.tokenizer.encode("xxx")).to(self.device)
 
         self.sizes = list(range(1, 5)) + list(range(5, 101, 5)) + list(range(125, 501, 25))
         self.sizes = np.int16(self.sizes)
