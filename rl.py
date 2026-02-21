@@ -1,9 +1,10 @@
 import sys
 import os
-
+# Fix for common environment issues
 sys.modules["markupsafe._speedups"] = None
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+import torch
+torch.set_float32_matmul_precision('high')
 import copy
 import json
 import queue
@@ -11,13 +12,11 @@ import threading
 import concurrent.futures
 from random import randint
 import traceback
-import torch
+import torch.nn.functional as F
 import schedulefree
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from collections import Counter
 import gc
-
 from sim_hand import Hand
 from sim_encoder import Encoder
 
@@ -39,7 +38,7 @@ class Wasserstein1DLoss(torch.nn.Module):
         # Exact 1D Wasserstein: Area between CDF curves
         cdf_diff = torch.abs(pred_cdf - target_cdf)
 
-        # Sum (Integrate) and scale by bucket distance
+        # Sum (Integrate) and Scale by metric distance
         return torch.sum(cdf_diff, dim=-1).mean() * self.delta_z
 
 
@@ -57,7 +56,7 @@ class DistributionalOTUtils:
         distributions = torch.zeros(batch_size, self.n_atoms, device=self.device)
 
         for i, r in enumerate(rewards_list):
-            if r is None:
+            if not r:  # Handle empty/None
                 zero_idx = (torch.abs(self.support)).argmin()
                 distributions[i, zero_idx] = 1.0
                 continue
@@ -65,12 +64,14 @@ class DistributionalOTUtils:
             bb = big_blinds[i].item() if big_blinds is not None else 1.0
             if bb < 1e-3: bb = 1.0
 
-            # Use mean of simulation samples as the target value
-            val = np.mean(r)
-            r_tensor = torch.tensor(val, device=self.device, dtype=torch.float32) / bb
+            # Vectorize the entire array of Monte Carlo samples
+            r_tensor = torch.tensor(r, device=self.device, dtype=torch.float32) / bb
             r_tensor = torch.clamp(r_tensor, self.min_return, self.max_return)
 
-            # Projection logic (Dual Splitting)
+            n_samples = len(r_tensor)
+            sample_weight = 1.0 / n_samples
+
+            # Dual Splitting Projection for ALL samples
             b = (r_tensor - self.min_return) / self.delta_z
             l = b.floor().long()
             u = b.ceil().long()
@@ -78,10 +79,18 @@ class DistributionalOTUtils:
             u = torch.clamp(u, 0, self.n_atoms - 1)
 
             exact_match = (l == u)
-            distributions[i, l] += torch.where(exact_match, 1.0, u.float() - b)
-            distributions[i, u] += torch.where(exact_match, 0.0, b - l.float())
+
+            # Accumulate the mass across the bins
+            # Using loop for clarity; index_add_ can be used for extreme optimization
+            for j in range(n_samples):
+                if exact_match[j]:
+                    distributions[i, l[j]] += sample_weight
+                else:
+                    distributions[i, l[j]] += sample_weight * (u[j].float() - b[j])
+                    distributions[i, u[j]] += sample_weight * (b[j] - l[j].float())
 
         return distributions
+
 
 class Simulator:
     def __init__(self):
@@ -90,6 +99,7 @@ class Simulator:
         self.model = AutoModelForCausalLM.from_config(config).to(self.device)
         self.model.load_state_dict(torch.load('GEN-17600000.pt', map_location=self.device, weights_only=True))
 
+        # Distributional head:
         # Predicts the outcome histogram (51 atoms) from the hidden state
         self.n_atoms = 31
         self.dist_head = torch.nn.Linear(config.hidden_size, self.n_atoms).to(self.device)
@@ -101,6 +111,7 @@ class Simulator:
         for param in self.ref_model.parameters():
             param.requires_grad = False
 
+
         self.model_lock = threading.Lock()
         self.tokenizer = AutoTokenizer.from_pretrained('./opt-it-2')
         self.tokenizer.padding_side = "left"
@@ -109,7 +120,7 @@ class Simulator:
         # Hero Tokens
         hero_ids = []
         for i in range(6):
-            enc = self.tokenizer.encode(f"xxx{i}x")
+            enc = self.tokenizer.encode(f"<xxx{i}>")
             hero_ids.append(enc[0])
         self.hero_token_ids = torch.tensor(hero_ids, dtype=torch.long, device=self.device)
 
@@ -137,19 +148,32 @@ class Simulator:
             self.allin_token.item()
         ], device=self.device)
 
+        self.relevant_token_tensor = torch.tensor([self.fold_token.item(), self.check_token.item(), self.call_token.item(), self.raise_token.item(), self.allin_token.item()], device=self.device)
+
         # Loss Functions
-        self.ot_utils = DistributionalOTUtils(self.device, min_return_bb=-200, max_return_bb=500, n_atoms=self.n_atoms)
-        self.wasserstein_loss = Wasserstein1DLoss(self.device, min_return=-200, max_return=500, n_atoms=self.n_atoms)
+        self.ot_utils = DistributionalOTUtils(self.device, min_return_bb=-200, max_return_bb=250, n_atoms=self.n_atoms)
+        self.wasserstein_loss = Wasserstein1DLoss(self.device, min_return=-200, max_return=250, n_atoms=self.n_atoms)
         self.policy_loss = torch.nn.CrossEntropyLoss()
 
         # Optimizer: Tracks both LLM and Distribution Head
         params = list(self.model.parameters()) + list(self.dist_head.parameters())
-        self.optimizer = schedulefree.AdamWScheduleFree(params, lr=1e-5)
+
+        # Explicitly declare warmup_steps=0 to bypass interpolation suppression
+        # on the pre-trained weights.
+        self.optimizer = schedulefree.AdamWScheduleFree(
+            params,
+            lr=1e-5,
+            warmup_steps=0,
+            # b1 controls momentum of the z sequence. 0.9 is standard for transformers.
+            # b2 controls the variance tracking.
+            betas=(0.9, 0.999),
+            weight_decay=0.01
+        )
         self.optimizer.train()
 
         self.n_sims = 16
-        self.batch_size = 256
-        self.num_generators = 5
+        self.batch_size = 16
+        self.num_generators = 7
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
         self.thread_local = threading.local()
         self.batch_queue = queue.Queue(maxsize=8)
@@ -260,14 +284,23 @@ class Simulator:
                 seq_len = input_ids.shape[1]
 
                 with self.model_lock:
-                    # Output hidden states for the Distrib Head
-                    outputs = self.model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
-                    logits = outputs.logits
-                    last_hidden = outputs.hidden_states[-1]
+                    # Enable bfloat16 mixed precision for the forward pass
+                    with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+                        # Output hidden states for the Distrib Head
+                        outputs = self.model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                        logits = outputs.logits
+                        last_hidden = outputs.hidden_states[-1]
 
                 # Forward pass on frozen reference model for sizing KL penalty
                 with torch.no_grad():
-                    ref_logits = self.ref_model(input_ids, attention_mask=attention_mask).logits
+                    with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+                        ref_logits = self.ref_model(input_ids, attention_mask=attention_mask).logits
+
+                # Ensure logits are cast back to float32 before loss calculations
+                # to maintain absolute precision in your distributional math
+                logits = logits.to(torch.float32)
+                ref_logits = ref_logits.to(torch.float32)
+                last_hidden = last_hidden.to(torch.float32)
 
                 # Offset by 1 because logits at t-1 predict token at t
                 current_tokens = input_ids[:, 1:]
@@ -294,6 +327,7 @@ class Simulator:
                 # Partition the valid tokens
                 hero_action_mask = is_action_token & is_hero_turn & q_train & valid_mask
                 other_mask = valid_mask & (~hero_action_mask)
+
                 hero_b_idx, hero_t_idx = torch.nonzero(hero_action_mask, as_tuple=True)
 
                 all_pred_logits = []
@@ -314,7 +348,10 @@ class Simulator:
 
                     hand_bb = ev_data.get('big_blind', 1.0)
                     valid_action_mask = torch.zeros(5, device=self.device)
+
+                    # Track both Expected Value and Risk (Standard Deviation)
                     means = np.full(5, -np.inf)
+                    risks = np.full(5, 1.0)
                     best_action_samples = None
 
                     for act_str, samples in ev_data.items():
@@ -323,17 +360,31 @@ class Simulator:
                             idx = act_str_to_idx[act_str]
                             if samples:
                                 valid_action_mask[idx] = 1.0
-                                means[idx] = np.mean(samples)
-                                if best_action_samples is None or means[idx] > np.max(means[means > -1e9]):
+
+                                # Extract true EV and true Risk from the rollouts
+                                action_mean = np.mean(samples)
+                                action_risk = np.std(samples)
+
+                                means[idx] = action_mean
+                                # Apply the strict bound to prevent NaN division
+                                risks[idx] = max(action_risk, 1.0)
+
+                                if best_action_samples is None or action_mean > np.max(means[means > -1e9]):
                                     best_action_samples = samples
 
-                    valid_means = means[means > -1e9]
-                    if len(valid_means) > 0:
-                        max_val = np.max(valid_means)
-                        std_dev = np.std(valid_means) if len(valid_means) > 1 else 0.0
-                        temp_divisor = max(std_dev, hand_bb * 1.0, 1e-3)
-                        exp_vals = np.exp((means - max_val) / temp_divisor)
-                        exp_vals[means == -np.inf] = 0
+                    valid_mask_idx = means > -1e9
+                    if np.any(valid_mask_idx):
+                        # Calculate Risk-Adjusted Scores: U(a) = \mu_a / \max(\sigma_a, 1.0)
+                        scores = np.full(5, -np.inf)
+                        scores[valid_mask_idx] = means[valid_mask_idx] / risks[valid_mask_idx]
+
+                        max_score = np.max(scores[valid_mask_idx])
+
+                        # Use a grounded, stake-invariant temperature (1 Big Blind)
+                        temp = max(hand_bb * 1.0, 1.0)
+
+                        exp_vals = np.exp((scores - max_score) / temp)
+                        exp_vals[~valid_mask_idx] = 0
                         probs = exp_vals / np.sum(exp_vals)
                     else:
                         probs = np.zeros(5)
@@ -347,10 +398,19 @@ class Simulator:
 
 
                     # Slice specific valid logits
-                    current_logits = logits[b, t_minus_1, self.action_token_ids].clone()
-                    current_logits[valid_action_mask == 0] = -100.0
-                    all_pred_logits.append(current_logits)
-                    all_target_probs.append(torch.tensor(probs, device=self.device, dtype=torch.float32))
+                    full_logits = logits[b, t_minus_1, :].clone()
+                    full_target_probs = torch.zeros(full_logits.shape[-1], device=self.device)
+
+                    # Map the 5 EV-derived action probabilities to their exact vocabulary indices
+                    full_target_probs[self.action_token_ids] = torch.tensor(probs, device=self.device, dtype=torch.float32)
+
+                    # Mask invalid actions to -100.0 so they don't eat probability mass
+                    invalid_action_mask = (valid_action_mask == 0)
+                    invalid_action_indices = self.action_token_ids[invalid_action_mask]
+                    full_logits[invalid_action_indices] = -100.0
+
+                    all_pred_logits.append(full_logits)
+                    all_target_probs.append(full_target_probs)
 
                 p_loss = torch.tensor(0.0, device=self.device)
                 ot_loss = torch.tensor(0.0, device=self.device)
@@ -379,8 +439,19 @@ class Simulator:
 
                     # Batchmean handles sequence length variations cleanly
                     kl_loss = F.kl_div(log_probs_train, probs_ref, reduction='batchmean')
-                    
-                total_loss = p_loss + (ot_loss / (self.n_atoms * 2.5)) + (0.1 * kl_loss)
+
+                    # Dynamic Token-Ratio Scaling for KL
+                    num_hero_tokens = hero_b_idx.numel()
+                    num_other_tokens = other_b_idx.numel()
+                    dynamic_kl_weight = num_other_tokens / max(num_hero_tokens, 1)
+
+                    # Support-Span Normalization for Optimal Transport
+                    # Normalizes the EMD (in BBs) to a strict [0, 1] scale based on the support bounds
+                    ot_span = self.ot_utils.max_return - self.ot_utils.min_return
+                    normalized_ot_loss = ot_loss / ot_span
+
+                    # Combine the normalized losses
+                    total_loss = p_loss + normalized_ot_loss + (dynamic_kl_weight * kl_loss)
 
                 if total_loss.requires_grad:
                     losses.append(total_loss.item())
@@ -405,9 +476,14 @@ class Simulator:
                     ot_mean = np.mean(ot_losses) if ot_losses else 0
                     print(f"Upd {self.global_updates} | Loss: {np.mean(losses):.4f} (Pol: {p_mean:.4f}, OT: {ot_mean:.4f}) | Q: {self.batch_queue.qsize()}")
                     losses, policy_losses, ot_losses = [], [], []
+
                     with self.model_lock:
                         self.model.eval()
+                        self.optimizer.eval()  # Swaps to the stable, averaged weights (x)
+
                         torch.save(self.model.state_dict(), f"RL-{self.global_updates}.pt")
+
+                        self.optimizer.train()  # Swaps back to the active training weights (z)
                         self.model.train()
 
         finally:
