@@ -86,8 +86,8 @@ class Simulator:
 
         # Engine Params
         self.n_sims = 16
-        self.batch_size = 32
-        self.num_generators = 4
+        self.batch_size = 256
+        self.num_generators = 16
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
         self.thread_local = threading.local()
         self.batch_queue = queue.Queue(maxsize=16)
