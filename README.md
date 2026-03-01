@@ -5,7 +5,7 @@ Informative game nodes and respective action distributions:
 [["", "", "", "", "", "2d7c"], [], ["p0c46445", "p1c9806", "p2c9321", "p3c37554", "p4c8072", "p5c8170", "p0c100", "p1c200"], ["p2f", "p3f", "p4f"], [], [], [], []]
 
 
-fold : 100.0% -100
+fold : 100.0% 0
 
 call 200 : 0.0% -0.04
 
