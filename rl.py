@@ -60,7 +60,7 @@ class Simulator:
         self.allin_token_id = self.allin_token.item()
         self.fold_token_id = self.fold_token.item()
 
-        self.min_size_token_id = self.tokenizer.encode("<xxx>")[0]
+        self.min_size_token_id = self.tokenizer.encode("<b1%>")[0]
         self.min_size_token = torch.tensor([self.min_size_token_id]).to(self.device)
 
         # Core Tokens
@@ -74,7 +74,7 @@ class Simulator:
         }
 
         # Token-Space Regret Supports
-        self.sizes = np.array(list(range(1, 5)) #...
+        self.sizes = np.array(list(range(1, 5)) xxx..., dtype=np.float32)
         self.torch_sizes_float = torch.tensor(self.sizes).to(self.device).float()
         self.sizes_floats = self.torch_sizes_float.tolist()
 
@@ -86,8 +86,8 @@ class Simulator:
 
         # Engine Params
         self.n_sims = 16
-        self.batch_size = 256
-        self.num_generators = 16
+        self.batch_size = 64
+        self.num_generators = 4
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
         self.thread_local = threading.local()
         self.batch_queue = queue.Queue(maxsize=16)
@@ -96,7 +96,7 @@ class Simulator:
 
         self.log_file = open('training_logs.csv', mode='w', newline='')
         self.csv_writer = csv.writer(self.log_file)
-        self.csv_writer.writerow(['Update', 'Total_Loss', 'Strategy_Loss', 'Regret_Loss', 'Queue_Size'])
+        self.csv_writer.writerow(['Update', 'Total_Loss', 'Strategy_Loss', 'Regret_Loss'])
 
     def get_thread_tokenizer(self):
         if not hasattr(self.thread_local, 'tokenizer'):
@@ -156,23 +156,51 @@ class Simulator:
                             if not means: continue
 
                             acts = list(means.keys())
+                            # scores are already in BB units
                             scores = np.array([means[a] for a in acts])
+
+                            # MUST keep max_score for the buffer_regret_targets below
                             max_score = np.max(scores)
 
-                            exp_vals = np.exp((scores - max_score) / big_blind)
-                            probs = exp_vals / np.sum(exp_vals)
+                            # Estimate V(s) - The average value of the node
+                            v_s = np.mean(scores)
+
+                            # Calculate instantaneous positive regrets: R+(s, a) = max(0, Q(s, a) - V(s))
+                            regrets = np.maximum(scores - v_s, 0)
+                            regret_sum = np.sum(regrets)
+
+                            # Regret Matching
+                            if regret_sum > 0:
+                                probs = regrets / regret_sum
+                            else:
+                                probs = np.ones(len(acts)) / len(acts)
 
                             strategy_target = {acts[j]: float(probs[j]) for j in range(len(acts))}
-                            total_prob = sum(strategy_target.values())
-                            strategy_target = {k: v / total_prob for k, v in strategy_target.items()}
+                            if self.global_updates == 0 and len(buffer_strategy_targets) < 2 and worker_id == 0:
+                                print(f"\n[Worker 0 Debug] Target Generation for Hero p{hero_idx}")
+                                # Print the raw EVs rounded to 2 decimal places for readability
+                                print(f"Raw EVs (BB): {{k: round(v, 2) for k, v in means.items()}}")
+                                print(f"Node EV:      {v_s:.2f}")
 
-                            #v_I = sum(strategy_target[a] * means[a] for a in acts)
+                                # Show the positive regrets that drive the policy
+                                regret_debug = {acts[i]: round(regrets[i], 2) for i in range(len(acts))}
+                                print(f"Regrets (R+): {regret_debug}")
+
+                                # Verify the final strategy distribution (Fold should be 0.0 here if EV is bad)
+                                strat_tgt_debug = {k: round(v, 4) for k, v in strategy_target.items()}
+                                print(f"Strat Target: {strat_tgt_debug}")
+                                # Show the raw regret target (distance to max) before the +1.0 token offset
+                                reg_tgt_debug = {act: round(max_score - means[act], 2) for act in acts}
+                                print(f"Reg Tgt(raw): {reg_tgt_debug}")
+                                print("-" * 50)
+                            # (No need to normalize strategy_target again, regrets / regret_sum is already a valid PDF)
 
                             buffer_strategy_text.append(base_encoded)
                             buffer_strategy_targets.append(strategy_target)
 
                             for act in acts:
                                 buffer_regret_text.append(f"{base_encoded}<{act}><unk>")
+                                # max_score is successfully used here:
                                 buffer_regret_targets.append(max_score - means[act])
 
                 except Exception as e:
@@ -207,7 +235,7 @@ class Simulator:
         try:
             while self.global_updates < 80000:
                 try:
-                    batch_data = self.batch_queue.get(timeout=300)
+                    batch_data = self.batch_queue.get(timeout=1200)
                 except queue.Empty:
                     print("Queue Empty - breaking")
                     break
@@ -259,8 +287,9 @@ class Simulator:
 
                 r_preds = reg_logits[:, -1, :]
 
+                # Treat the 1.0 token as 0.0 regret by offsetting the target by +1.0
                 target_classes = [
-                    (torch.abs(self.torch_sizes_float - max(1.0, float(reg)))).argmin().item()
+                    (torch.abs(self.torch_sizes_float - (float(reg) + 1.0))).argmin().item()
                     for reg in batch_data['regret_targets']
                 ]
                 target_tensor = torch.tensor(target_classes, device=self.device, dtype=torch.long)
@@ -269,6 +298,7 @@ class Simulator:
                 end_idx = start_idx + len(self.sizes)
                 b_token_preds = r_preds[:, start_idx:end_idx]
 
+                # Convert logits to a valid probability distribution
                 probs = F.softmax(b_token_preds, dim=-1)
 
                 # Compute predicted Cumulative Distribution Function (CDF)
@@ -290,7 +320,6 @@ class Simulator:
                 # Multiply the mass moved by the distance it had to travel, then average over batch
                 r_loss = torch.mean(torch.sum(cdf_diff * bin_distances, dim=-1))
 
-                # Optimization
                 total_loss = s_loss + r_loss + (beta * kl_loss)
 
                 if total_loss.requires_grad:
@@ -304,7 +333,7 @@ class Simulator:
 
                 self.global_updates += 1
                 if self.global_updates % 10 == 0:
-                    self.csv_writer.writerow([self.global_updates, total_loss.item(), s_loss.item(), r_loss.item(), self.batch_queue.qsize()])
+                    self.csv_writer.writerow([self.global_updates, total_loss.item(), s_loss.item(), r_loss.item()])
                     self.log_file.flush()
 
                 if self.global_updates % 100 == 0:
