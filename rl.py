@@ -2,9 +2,6 @@ import sys
 import os
 import copy
 import json
-import queue
-import threading
-import concurrent.futures
 from random import randint
 import traceback
 import numpy as np
@@ -21,6 +18,27 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from sim_hand import Hand
 from sim_encoder import Encoder
+
+
+class ReplayBuffer:
+    def __init__(self, capacity=10000):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+
+    def push(self, data_dict):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = data_dict
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        return [self.buffer[i] for i in indices]
+
+    def __len__(self):
+        return len(self.buffer)
 
 
 class Simulator:
@@ -41,7 +59,6 @@ class Simulator:
         for param in self.ref_model.parameters():
             param.requires_grad = False
 
-        self.model_lock = threading.Lock()
         self.tokenizer = AutoTokenizer.from_pretrained('./opt-it-2')
         self.tokenizer.padding_side = "left"
         self.tokenizer.pad_token = self.tokenizer.unk_token
@@ -64,7 +81,7 @@ class Simulator:
         self.min_size_token = torch.tensor([self.min_size_token_id]).to(self.device)
 
         # Core Tokens
-        self.hero_token_ids = torch.tensor([self.tokenizer.encode(f"<xxx{i}>")[0] for i in range(6)], device=self.device)
+        self.hero_token_ids = torch.tensor([self.tokenizer.encode(f"<herop{i}>")[0] for i in range(6)], device=self.device)
         self.action_tokens = {
             'fold': self.fold_token_id,
             'check': self.check_token_id,
@@ -74,7 +91,7 @@ class Simulator:
         }
 
         # Token-Space Regret Supports
-        self.sizes = np.array(list(range(1, 5)) xxx..., dtype=np.float32)
+        self.sizes = np.array(list(range(1, 5)) + list(range(5, 101, 5)) + list(range(125, 501, 25)), dtype=np.float32)
         self.torch_sizes_float = torch.tensor(self.sizes).to(self.device).float()
         self.sizes_floats = self.torch_sizes_float.tolist()
 
@@ -87,268 +104,177 @@ class Simulator:
         # Engine Params
         self.n_sims = 16
         self.batch_size = 64
-        self.num_generators = 4
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
-        self.thread_local = threading.local()
-        self.batch_queue = queue.Queue(maxsize=16)
-        self.stop_event = threading.Event()
         self.global_updates = 0
+
+        self.replay_buffer = ReplayBuffer(capacity=100000)
+        self.encoder = Encoder()
 
         self.log_file = open('training_logs.csv', mode='w', newline='')
         self.csv_writer = csv.writer(self.log_file)
         self.csv_writer.writerow(['Update', 'Total_Loss', 'Strategy_Loss', 'Regret_Loss'])
 
-    def get_thread_tokenizer(self):
-        if not hasattr(self.thread_local, 'tokenizer'):
-            self.thread_local.tokenizer = copy.deepcopy(self.tokenizer)
-        return self.thread_local.tokenizer
-
-    def get_thread_encoders(self, count):
-        if not hasattr(self.thread_local, 'encoders'):
-            self.thread_local.encoders = []
-        while len(self.thread_local.encoders) < count:
-            self.thread_local.encoders.append(Encoder())
-        return self.thread_local.encoders[:count]
-
-    def get_single_thread_encoder(self):
-        if not hasattr(self.thread_local, 'single_encoder'):
-            self.thread_local.single_encoder = Encoder()
-        return self.thread_local.single_encoder
-
-    def data_generator_worker(self, worker_id):
+    def generate_experience(self):
         itr_street_cutoffs = [3, 2, 1, 0]
         hand_street_cutoffs = [5, 4, 3, 0]
 
-        buffer_strategy_text, buffer_strategy_targets = [], []
-        buffer_regret_text, buffer_regret_targets = [], []
+        itr_street_index = min((self.global_updates // 10000), len(itr_street_cutoffs) - 1)
 
-        while not self.stop_event.is_set():
-            updates = self.global_updates
-            itr_street_index = min((updates // 20000), len(itr_street_cutoffs) - 1)
+        hands, hero_ev_data, hero_indices = self.batch_generate_hands(
+            self.batch_size, itr_street_cutoffs[itr_street_index]
+        )
 
-            while (len(buffer_strategy_text) < self.batch_size or len(buffer_regret_text) < self.batch_size) and not self.stop_event.is_set():
-                try:
-                    hands, hero_ev_data, hero_indices = self.batch_generate_hands(
-                        self.batch_size, itr_street_cutoffs[itr_street_index]
-                    )
-                    local_enc = self.get_single_thread_encoder()
+        for i, hand in enumerate(hands):
+            if not hero_ev_data[i]: continue
 
-                    for i, hand in enumerate(hands):
-                        if not hero_ev_data[i]: continue
+            hero_idx = hero_indices[i]
+            big_blind = float(hand.big_blind) if hand.big_blind > 0 else 1.0
 
-                        hero_idx = hero_indices[i]
-                        uh = hand.get_u_hand(hero_idx)
-                        big_blind = float(hand.big_blind) if hand.big_blind > 0 else 1.0
+            for node_data in hero_ev_data[i]:
+                # Unpack the temporally frozen state and its perfectly aligned EVs
+                state_json = node_data['state_json']
+                ev_dict = node_data['evs']
 
-                        if not uh[0][hero_idx] or len(uh[1]) < hand_street_cutoffs[itr_street_index]:
-                            continue
-
-                        encoded_str = local_enc.encode(json.dumps(uh))
-                        base_encoded = f"{encoded_str}<herop{hero_idx}>"
-
-                        for ev_dict in hero_ev_data[i]:
-                            means = {
-                                act_str: float(np.mean(samples)) / big_blind
-                                for act_str, samples in ev_dict.items()
-                                if act_str in self.action_tokens and samples
-                            }
-
-                            if not means: continue
-
-                            acts = list(means.keys())
-                            # scores are already in BB units
-                            scores = np.array([means[a] for a in acts])
-
-                            # MUST keep max_score for the buffer_regret_targets below
-                            max_score = np.max(scores)
-
-                            # Estimate V(s) - The average value of the node
-                            v_s = np.mean(scores)
-
-                            # Calculate instantaneous positive regrets: R+(s, a) = max(0, Q(s, a) - V(s))
-                            regrets = np.maximum(scores - v_s, 0)
-                            regret_sum = np.sum(regrets)
-
-                            # Regret Matching
-                            if regret_sum > 0:
-                                probs = regrets / regret_sum
-                            else:
-                                probs = np.ones(len(acts)) / len(acts)
-
-                            strategy_target = {acts[j]: float(probs[j]) for j in range(len(acts))}
-                            if self.global_updates == 0 and len(buffer_strategy_targets) < 2 and worker_id == 0:
-                                print(f"\n[Worker 0 Debug] Target Generation for Hero p{hero_idx}")
-                                # Print the raw EVs rounded to 2 decimal places for readability
-                                print(f"Raw EVs (BB): {{k: round(v, 2) for k, v in means.items()}}")
-                                print(f"Node EV:      {v_s:.2f}")
-
-                                # Show the positive regrets that drive the policy
-                                regret_debug = {acts[i]: round(regrets[i], 2) for i in range(len(acts))}
-                                print(f"Regrets (R+): {regret_debug}")
-
-                                # Verify the final strategy distribution (Fold should be 0.0 here if EV is bad)
-                                strat_tgt_debug = {k: round(v, 4) for k, v in strategy_target.items()}
-                                print(f"Strat Target: {strat_tgt_debug}")
-                                # Show the raw regret target (distance to max) before the +1.0 token offset
-                                reg_tgt_debug = {act: round(max_score - means[act], 2) for act in acts}
-                                print(f"Reg Tgt(raw): {reg_tgt_debug}")
-                                print("-" * 50)
-                            # (No need to normalize strategy_target again, regrets / regret_sum is already a valid PDF)
-
-                            buffer_strategy_text.append(base_encoded)
-                            buffer_strategy_targets.append(strategy_target)
-
-                            for act in acts:
-                                buffer_regret_text.append(f"{base_encoded}<{act}><unk>")
-                                # max_score is successfully used here:
-                                buffer_regret_targets.append(max_score - means[act])
-
-                except Exception as e:
-                    print(f"Worker {worker_id} Crash: {e}")
-                    traceback.print_exc()
+                parsed_uh = json.loads(state_json)
+                if not parsed_uh[0][hero_idx] or len(parsed_uh[1]) < hand_street_cutoffs[itr_street_index]:
                     continue
 
-            if self.stop_event.is_set(): break
+                encoded_str = self.encoder.encode(state_json)
+                base_encoded = f"{encoded_str}<herop{hero_idx}>"
 
-            # Safely extract and clear exact batch sizes to prevent memory fragmentation
-            batch_data = {
-                'strategy_text': [buffer_strategy_text.pop(0) for _ in range(self.batch_size)],
-                'strategy_targets': [buffer_strategy_targets.pop(0) for _ in range(self.batch_size)],
-                'regret_text': [buffer_regret_text.pop(0) for _ in range(self.batch_size)],
-                'regret_targets': [buffer_regret_targets.pop(0) for _ in range(self.batch_size)]
-            }
+                # Feed the frozen ev_dict directly into the means calculation
+                means = {
+                    act_str: float(np.mean(samples)) / big_blind
+                    for act_str, samples in ev_dict.items()
+                    if act_str in self.action_tokens and samples
+                }
 
-            while not self.stop_event.is_set():
-                try:
-                    self.batch_queue.put(batch_data, timeout=1)
-                    break
-                except queue.Full:
-                    continue
+                if not means: continue
+
+                acts = list(means.keys())
+                scores = np.array([means[a] for a in acts])
+                max_score = np.max(scores)
+
+                # Package the immutable environment data
+                chosen_act = np.random.choice(acts)
+                experience = {
+                    'strategy_text': base_encoded,
+                    'legal_actions': acts,
+                    'ev_scores': scores.tolist(),
+                    'regret_text': f"{base_encoded}<{chosen_act}><unk>",
+                    'regret_target': max_score - means[chosen_act]
+                }
+
+                self.replay_buffer.push(experience)
 
     def rl(self):
-        threads = [threading.Thread(target=self.data_generator_worker, args=(i,), daemon=True) for i in range(self.num_generators)]
-        for t in threads: t.start()
-
-        print("Starting Joint Training: Deep CFR Strategy + Token-Space Regret + KL Div...")
+        print("Starting Joint Training: Sequential Generation + Replay Buffer...")
         beta = 1.0
 
-        try:
-            while self.global_updates < 80000:
-                try:
-                    batch_data = self.batch_queue.get(timeout=1200)
-                except queue.Empty:
-                    print("Queue Empty - breaking")
-                    break
+        while self.global_updates < 40000:
+            # Sequentially generate a batch of rollouts and push them to disk history
+            try:
+                self.generate_experience()
+            except Exception as e:
+                print(f"Generator Exception: {e}")
+                traceback.print_exc()
 
-                # Strategy & KL
-                strat_inputs = self.tokenizer(batch_data['strategy_text'], padding=True, return_tensors="pt")
-                strat_ids = strat_inputs.input_ids.to(self.device, non_blocking=True)
-                strat_mask = strat_inputs.attention_mask.to(self.device, non_blocking=True)
+            # Wait until buffer has enough history
+            if len(self.replay_buffer) < self.batch_size:
+                continue
 
-                with self.model_lock:
-                    with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
-                        strat_logits = self.model(strat_ids, attention_mask=strat_mask).logits.float()
+            # Sample randomly from the entire history
+            samples = self.replay_buffer.sample(self.batch_size)
 
-                with torch.no_grad():
-                    with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
-                        ref_strat_logits = self.ref_model(strat_ids, attention_mask=strat_mask).logits.float()
+            batch_data = {
+                'strategy_text': [s['strategy_text'] for s in samples],
+                'legal_actions': [s['legal_actions'] for s in samples],
+                'ev_scores': [s['ev_scores'] for s in samples],
+                'regret_text': [s['regret_text'] for s in samples],
+                'regret_targets': [s['regret_target'] for s in samples]
+            }
 
-                s_preds = strat_logits[:, -1, :]
-                s_targets = torch.zeros_like(s_preds)
+            # Strategy Forward Pass
+            strat_inputs = self.tokenizer(batch_data['strategy_text'], padding=True, return_tensors="pt")
+            strat_ids = strat_inputs.input_ids.to(self.device, non_blocking=True)
+            strat_mask = strat_inputs.attention_mask.to(self.device, non_blocking=True)
 
-                for b, target_dict in enumerate(batch_data['strategy_targets']):
-                    for act, prob in target_dict.items():
-                        s_targets[b, self.action_tokens[act]] = prob
+            with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+                strat_logits = self.model(strat_ids, attention_mask=strat_mask).logits.float()
 
-                s_loss = F.cross_entropy(s_preds, s_targets)
+            s_preds = strat_logits[:, -1, :]
 
-                shift_logits_train = strat_logits[..., :-1, :].contiguous()
-                shift_logits_ref = ref_strat_logits[..., :-1, :].contiguous()
-                shift_mask = strat_mask[..., 1:].contiguous().bool()
+            # Isolate strictly the 5 action logits
+            action_ids_list = [self.fold_token_id, self.check_token_id, self.call_token_id, self.raise_token_id, self.allin_token_id]
+            action_tensor = torch.tensor(action_ids_list, device=self.device)
+            s_preds_actions = s_preds[:, action_tensor]
 
-                flat_logits_train = shift_logits_train.view(-1, shift_logits_train.size(-1))[shift_mask.view(-1)]
-                flat_logits_ref = shift_logits_ref.view(-1, shift_logits_ref.size(-1))[shift_mask.view(-1)]
+            s_targets_actions = torch.zeros_like(s_preds_actions)
+            illegal_mask = torch.ones_like(s_preds_actions, dtype=torch.bool)
+            dynamic_weights = []
 
-                kl_loss = F.kl_div(
-                    F.log_softmax(flat_logits_train, dim=-1),
-                    F.softmax(flat_logits_ref, dim=-1),
-                    reduction='batchmean'
-                )
+            with torch.no_grad():
+                for b in range(self.batch_size):
+                    acts = batch_data['legal_actions'][b]
+                    scores = np.array(batch_data['ev_scores'][b])
+                    max_score = np.max(scores)
 
-                # Token-Space Regret
-                reg_inputs = self.tokenizer(batch_data['regret_text'], padding=True, return_tensors="pt")
-                reg_ids = reg_inputs.input_ids.to(self.device, non_blocking=True)
-                reg_mask = reg_inputs.attention_mask.to(self.device, non_blocking=True)
-                reg_mask[:, -1] = 1
+                    # Map legal actions to our 5-dim tensor
+                    local_indices = [action_ids_list.index(self.action_tokens[act]) for act in acts]
+                    illegal_mask[b, local_indices] = False
 
-                with self.model_lock:
-                    with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
-                        reg_logits = self.model(reg_ids, attention_mask=reg_mask).logits.float()
+                    # Extract CURRENT model probabilities for calculating v_s
+                    valid_logits = s_preds_actions[b, local_indices]
+                    valid_probs = F.softmax(valid_logits, dim=-1).cpu().numpy()
 
-                r_preds = reg_logits[:, -1, :]
+                    # Calculate Expected Value of the CURRENT policy
+                    v_s = np.sum(valid_probs * scores)
 
-                # Treat the 1.0 token as 0.0 regret by offsetting the target by +1.0
-                target_classes = [
-                    (torch.abs(self.torch_sizes_float - (float(reg) + 1.0))).argmin().item()
-                    for reg in batch_data['regret_targets']
-                ]
-                target_tensor = torch.tensor(target_classes, device=self.device, dtype=torch.long)
+                    # Calculate Instantaneous Regrets dynamically
+                    regrets = np.maximum(scores - v_s, 0)
+                    regret_sum = np.sum(regrets)
 
-                start_idx = self.min_size_token_id
-                end_idx = start_idx + len(self.sizes)
-                b_token_preds = r_preds[:, start_idx:end_idx]
+                    if regret_sum > 0:
+                        target_probs = regrets / regret_sum
+                    else:
+                        best_acts = (scores >= max_score - 1e-4)
+                        target_probs = best_acts.astype(float) / np.sum(best_acts)
 
-                # Convert logits to a valid probability distribution
-                probs = F.softmax(b_token_preds, dim=-1)
+                    for i, idx in enumerate(local_indices):
+                        s_targets_actions[b, idx] = target_probs[i]
 
-                # Compute predicted Cumulative Distribution Function (CDF)
-                cdf_pred = torch.cumsum(probs, dim=-1)
+                    # Baseline weight of 1.0, max weight of ~8.0 for massive river mistakes
+                    ev_spread = max_score - np.min(scores)
+                    weight = float(ev_spread) + 1e-3  # Tiny floor to prevent strict zero division
+                    dynamic_weights.append(weight)
 
-                # Compute target CDF (Step function: 0 before the true class, 1 at and after)
-                batch_size, num_classes = b_token_preds.shape
-                indices = torch.arange(num_classes, device=self.device).expand(batch_size, -1)
-                cdf_target = (indices >= target_tensor.unsqueeze(1)).float()
+            s_preds_actions = s_preds_actions.masked_fill(illegal_mask, -1e2)
 
-                # Calculate the distances between your specific token bins
-                bin_distances = torch.diff(self.torch_sizes_float)  # Shape: [num_classes - 1]
+            s_loss_unreduced = F.cross_entropy(s_preds_actions, s_targets_actions, reduction='none')
 
-                # Weighted 1D Wasserstein Loss
-                # We slice [:, :-1] because the total mass must sum to 1,
-                # making the difference at the final bin always exactly 0.
-                cdf_diff = torch.abs(cdf_pred[:, :-1] - cdf_target[:, :-1])
+            # Apply normalized dynamic weights
+            batch_weights = torch.tensor(dynamic_weights, device=self.device)
+            batch_weights = batch_weights / batch_weights.mean()
+            s_loss = torch.mean(s_loss_unreduced * batch_weights)
 
-                # Multiply the mass moved by the distance it had to travel, then average over batch
-                r_loss = torch.mean(torch.sum(cdf_diff * bin_distances, dim=-1))
+            total_loss = s_loss
+            if total_loss.requires_grad:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
-                total_loss = s_loss + r_loss + (beta * kl_loss)
+            self.global_updates += 1
+            if self.global_updates % 10 == 0:
+                self.csv_writer.writerow([self.global_updates, total_loss.item(), s_loss.item()])
+                self.log_file.flush()
 
-                if total_loss.requires_grad:
-                    total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-
-                del strat_logits, ref_strat_logits, reg_logits, strat_ids, reg_ids, strat_inputs, reg_inputs
-                del shift_logits_train, shift_logits_ref, flat_logits_train, flat_logits_ref, batch_data
-
-                self.global_updates += 1
-                if self.global_updates % 10 == 0:
-                    self.csv_writer.writerow([self.global_updates, total_loss.item(), s_loss.item(), r_loss.item()])
-                    self.log_file.flush()
-
-                if self.global_updates % 100 == 0:
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    print(f"Upd {self.global_updates} | Total: {total_loss.item():.4f} (Strat: {s_loss.item():.4f}, Reg: {r_loss.item():.4f}, KL: {kl_loss.item():.4f})")
-
-                    with self.model_lock:
-                        self.model.eval()
-                        torch.save(self.model.state_dict(), f"RL-{self.global_updates}.pt")
-                        self.model.train()
-
-        finally:
-            self.stop_event.set()
-            for t in threads: t.join()
+            if self.global_updates % 100 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"Upd {self.global_updates} | Total: {total_loss.item():.4f} (Strat: {s_loss.item():.4f})")
+                self.model.eval()
+                torch.save(self.model.state_dict(), f"RL-{self.global_updates}.pt")
+                self.model.train()
 
     def batch_generate_hands(self, n_hands, street_cutoff):
         hands = [Hand() for _ in range(n_hands)]
@@ -371,7 +297,11 @@ class Simulator:
                 cf_sizes = self.select_raise_batch(ev_hand_objs)
                 bulk_results = self.generate_bulk_evs(ev_hand_objs, cf_sizes)
                 for k, global_idx in enumerate(ev_indices):
-                    hero_ev_data[global_idx].append(bulk_results[k])
+                    current_state_json = json.dumps(ev_hand_objs[k].get_u_hand(hero_indices[global_idx]))
+                    hero_ev_data[global_idx].append({
+                        'state_json': current_state_json,
+                        'evs': bulk_results[k]
+                    })
 
             actions, sizes = self.select_action_batch(current_hands)
             next_active_indices = []
@@ -387,7 +317,11 @@ class Simulator:
                 elif action == 'call':
                     hand.call()
                 elif action == 'raise':
-                    hand.bet_or_raise(size)
+                    action_space = hand.get_action_space()
+                    if size >= (0.5 * action_space.get('max_bet', 0)):
+                        hand.bet_or_raise(action_space.get('max_bet', 0))
+                    else:
+                        hand.bet_or_raise(size)
                 elif action == 'allin':
                     action_space = hand.get_action_space()
                     if 'max_bet' in action_space:
@@ -424,6 +358,23 @@ class Simulator:
 
             max_bet = action_space.get('max_bet', 0)
             valid_actions = {'fold', 'check', 'call', 'min_bet', 'max_bet'}
+
+            # Mirror the exact boolean logic from process_hand_cpu
+            can_raise = 'min_bet' in action_space
+            if can_raise and action_space['min_bet'] >= max_bet:
+                can_raise = False
+
+            can_call = 'call' in action_space
+            call_is_allin = can_call and not can_raise
+
+            # Discard branches based strictly on the synchronized logic
+            if not can_raise:
+                valid_actions.discard('min_bet')
+
+            if call_is_allin:
+                # If call is a forced all-in, discard max_bet to prevent duplicate tree simulation
+                valid_actions.discard('max_bet')
+            # ---------------------------------
 
             for root_action in action_space.keys():
                 if root_action not in valid_actions or root_action == 'fold':
@@ -476,9 +427,14 @@ class Simulator:
                     if 'max_bet' in action_space:
                         sim.bet_or_raise(action_space['max_bet'])
                     else:
-                        sim.call()  # Fallback for call-is-allin
+                        sim.call()
                 elif act == 'raise':
-                    sim.bet_or_raise(sz)
+                    action_space = sim.get_action_space()
+                    # Keep the threshold here ONLY for environment execution
+                    if sz >= (0.5 * action_space.get('max_bet', 0)):
+                        sim.bet_or_raise(action_space.get('max_bet', 0))
+                    else:
+                        sim.bet_or_raise(sz)
 
                 if sim.done:
                     p = sim.state.payoffs
@@ -505,26 +461,37 @@ class Simulator:
 
         for i, hand in enumerate(hand_list):
             action_space = hand.get_action_space()
+            max_bet = action_space.get('max_bet', 0)
+
+            # Re-evaluate the booleans to ensure final token mapping is completely gapless
+            can_raise = 'min_bet' in action_space
+            if can_raise and action_space['min_bet'] >= max_bet:
+                can_raise = False
+
+            can_call = 'call' in action_space
+            call_is_allin = can_call and not can_raise
 
             if 'min_bet' in final_output[i]:
                 final_output[i]['raise'] = final_output[i].pop('min_bet')
             if 'max_bet' in final_output[i]:
                 final_output[i]['allin'] = final_output[i].pop('max_bet')
 
-            # Short-stack Call-is-Allin logic (Use pop to remove 'call' from targets)
-            if 'min_bet' not in action_space and 'call' in final_output[i]:
+            # If the inference mask forces a call to be an allin, the target must also be an allin
+            if call_is_allin and 'call' in final_output[i]:
                 final_output[i]['allin'] = final_output[i].pop('call')
+            # ---------------------------------
 
         return final_output
+
 
     @torch.inference_mode()
     def select_raise_batch(self, hands):
         if not hands: return []
-        thread_encoders = self.get_thread_encoders(len(hands))
-        results = list(self.executor.map(self.process_hand_cpu, zip(hands, thread_encoders[:len(hands)])))
+
+        results = [self.process_hand_cpu(hand) for hand in hands]
         encoded_strs, min_bet_tokens, max_bets, pot_sizes, _, _, _, _, actor_indices = zip(*results)
-        tokenizer = self.get_thread_tokenizer()
-        inputs = tokenizer(list(encoded_strs), padding=True, return_tensors="pt")
+
+        inputs = self.tokenizer(list(encoded_strs), padding=True, return_tensors="pt")
 
         input_ids = inputs.input_ids.to(self.device, non_blocking=True)
         attention_mask = inputs.attention_mask.to(self.device, non_blocking=True)
@@ -567,71 +534,66 @@ class Simulator:
     def select_action_batch(self, hands):
         if not hands: return [], []
 
-        thread_encoders = self.get_thread_encoders(len(hands))
-        results = list(self.executor.map(self.process_hand_cpu, zip(hands, thread_encoders[:len(hands)])))
+        results = [self.process_hand_cpu(hand) for hand in hands]
+        encoded_strs, min_bet_tokens, max_bets, pot_sizes, can_check, can_raise, can_call, call_is_allin, actor_indices = zip(*results)
 
-        # Unpack the hand state
-        encoded_strs, min_bet_tokens, max_bets, pot_sizes, can_check, can_raise, can_call, call_is_allin, actor_indices = zip(
-            *results)
+        queries = [f"{encoded_strs[i]}<herop{actor_indices[i]}>" for i in range(len(hands))]
 
-        tokenizer = self.get_thread_tokenizer()
-
-        flat_queries = []
-        action_maps = []  # Tracks which legal actions belong to which hand index
-
-        # Build the specific action queries based on legal moves
-        for i in range(len(hands)):
-            base_encoded = f"{encoded_strs[i]}<herop{actor_indices[i]}>"
-            legal_actions = []
-
-            if can_check[i]:
-                legal_actions.append('check')
-            else:
-                legal_actions.append('fold')
-
-            if can_call[i] and not call_is_allin[i]: legal_actions.append('call')
-            if can_raise[i]: legal_actions.append('raise')
-            if max_bets[i] > 0 or call_is_allin[i]: legal_actions.append('allin')
-
-            action_maps.append(legal_actions)
-            for act in legal_actions:
-                # Append <unk> to query the Pain/Regret distribution head
-                flat_queries.append(f"{base_encoded}<{act}><unk>")
-
-        # Batched Forward Pass to get Pain Distributions
-        inputs = tokenizer(flat_queries, padding=True, return_tensors="pt")
+        inputs = self.tokenizer(queries, padding=True, return_tensors="pt")
         input_ids = inputs.input_ids.to(self.device, non_blocking=True)
         attention_mask = inputs.attention_mask.to(self.device, non_blocking=True)
 
         logits = self.model(input_ids, attention_mask=attention_mask).logits[:, -1, :]
 
-        # Calculate Expected Pain from the CDF bins
-        start_id = self.min_size_token.item()
-        num_sizes = len(self.sizes_floats)
-        pain_logits = logits[:, start_id: start_id + num_sizes]
+        action_keys = ['fold', 'check', 'call', 'raise', 'allin']
+        action_ids = [self.fold_token_id, self.check_token_id, self.call_token_id, self.raise_token_id, self.allin_token_id]
+        action_tensor = torch.tensor(action_ids, device=self.device)
 
-        # Convert logits to probabilities over the bins
-        pain_probs = F.softmax(pain_logits, dim=-1)
-
-        # Multiply by the actual bin values (1.0 to 500.0) and sum to get the continuous expected pain
-        expected_pains = torch.sum(pain_probs * self.torch_sizes_float, dim=-1)  # Shape: [len(flat_queries)]
+        action_logits = logits[:, action_tensor]
 
         final_actions = [''] * len(hands)
         final_sizes = [0] * len(hands)
         raise_indexes = []
 
-        query_idx = 0
+        for i in range(len(hands)):
+            legal_mask = torch.zeros(5, dtype=torch.bool, device=self.device)
 
-        # Strict Action Selection (Minimize Pain)
-        for i, legal_actions in enumerate(action_maps):
-            # Extract the pain values specific to this hand's legal actions
-            hand_pains = expected_pains[query_idx: query_idx + len(legal_actions)]
-            query_idx += len(legal_actions)
+            if can_check[i]:
+                legal_mask[1] = True
+            else:
+                legal_mask[0] = True
 
-            # STRICT MINIMIZATION: Find the index of the action with the lowest expected pain
-            best_action_idx = torch.argmin(hand_pains).item()
-            chosen_act = legal_actions[best_action_idx]
+            if can_call[i] and not call_is_allin[i]: legal_mask[2] = True
+            if can_raise[i]: legal_mask[3] = True
+            if max_bets[i] > 0 or call_is_allin[i]: legal_mask[4] = True
 
+            #action_logits[i].masked_fill_(~legal_mask, float('-inf'))
+
+            # DO NOT mask the logits with -inf
+        action_probs = F.softmax(action_logits, dim=-1)
+
+        # Apply the legal mask directly to the probabilities
+        legal_mask_tensor = torch.stack([
+            torch.tensor([
+                not can_check[i],  # fold
+                can_check[i],  # check
+                can_call[i] and not call_is_allin[i],  # call
+                can_raise[i],  # raise
+                max_bets[i] > 0 or call_is_allin[i]  # allin
+            ], device=self.device) for i in range(len(hands))
+        ])
+
+        # Zero out illegal probabilities
+        action_probs = action_probs * legal_mask_tensor.float()
+
+        # Re-normalize so they sum back to 1.0 safely
+        sum_probs = action_probs.sum(dim=-1, keepdim=True)
+        action_probs = torch.where(sum_probs > 0, action_probs / sum_probs, legal_mask_tensor.float() / legal_mask_tensor.sum(dim=-1, keepdim=True))
+
+        chosen_indices = torch.multinomial(action_probs, num_samples=1).squeeze(1)
+
+        for i in range(len(hands)):
+            chosen_act = action_keys[chosen_indices[i].item()]
             final_actions[i] = chosen_act
 
             if chosen_act == 'allin':
@@ -639,23 +601,23 @@ class Simulator:
             elif chosen_act == 'raise':
                 raise_indexes.append(i)
 
-        del inputs, input_ids, attention_mask, logits, pain_logits, pain_probs, expected_pains
+        del inputs, input_ids, attention_mask, logits, action_logits, action_probs
 
-        # If any hand chose to raise, query the model again specifically for the sizing distribution
         if raise_indexes:
+            start_id = self.min_size_token.item()
+            num_sizes = len(self.sizes_floats)
+
             r_encoded = [encoded_strs[i] for i in raise_indexes]
-            r_inputs = tokenizer(r_encoded, padding=True, return_tensors="pt")
+            r_inputs = self.tokenizer(r_encoded, padding=True, return_tensors="pt")
             r_ids = r_inputs.input_ids.to(self.device, non_blocking=True)
             r_mask = r_inputs.attention_mask.to(self.device, non_blocking=True)
             r_actors = self.hero_token_ids[list(np.array(actor_indices)[raise_indexes])].to(self.device)
             r_raise_tok = torch.full((len(raise_indexes), 1), self.raise_token_id, device=self.device)
 
-            # Note: We do NOT append <unk> here, so the model knows to output the bet sizing distribution
             r_final_ids = torch.cat([r_ids, r_actors.unsqueeze(1), r_raise_tok], dim=1)
             r_final_mask = torch.cat([r_mask, torch.ones((len(raise_indexes), 2), device=self.device)], dim=1)
 
             r_logits = self.model(r_final_ids, attention_mask=r_final_mask).logits[:, -1, :]
-
             size_logits = r_logits[:, start_id: start_id + num_sizes]
 
             r_min_tokens = torch.tensor([min_bet_tokens[i] for i in raise_indexes], device=self.device)
@@ -667,7 +629,7 @@ class Simulator:
             r_chosen_pct = self.torch_sizes_float[r_indices]
 
             r_bets = (torch.tensor([pot_sizes[i] for i in raise_indexes], device=self.device) * (
-                        r_chosen_pct / 100.0)).long().tolist()
+                    r_chosen_pct / 100.0)).long().tolist()
 
             for k, hand_idx in enumerate(raise_indexes):
                 final_sizes[hand_idx] = int(min(r_bets[k], max_bets[hand_idx]))
@@ -677,14 +639,13 @@ class Simulator:
 
         return final_actions, final_sizes
 
-    def process_hand_cpu(self, args):
-        hand, encoder = args
+    def process_hand_cpu(self, hand):
         action_space = hand.get_action_space()
         pot_size = hand.pot_size()
 
         if 'min_bet' in action_space:
             idx = np.searchsorted(self.sizes_floats, (action_space['min_bet'] / pot_size) * 100, side='left')
-            min_bet_token = self.min_size_token + min(idx, len(self.sizes_floats) - 1)
+            min_bet_token = self.min_size_token_id + min(idx, len(self.sizes_floats) - 1)
             max_bet = action_space['max_bet']
         else:
             min_bet_token = 0
@@ -696,11 +657,13 @@ class Simulator:
         can_raise = 'min_bet' in action_space
         can_call = 'call' in action_space
 
-        # If they can call but do not have enough chips to raise, calling puts them all-in
+        if can_raise and action_space['min_bet'] >= max_bet:
+            can_raise = False
+
         call_is_allin = can_call and not can_raise
 
         return (
-            encoder.encode(json.dumps(hand.get_u_hand(turn_idx))),
+            self.encoder.encode(json.dumps(hand.get_u_hand(turn_idx))),
             min_bet_token,
             max_bet,
             pot_size,
