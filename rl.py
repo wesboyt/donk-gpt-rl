@@ -26,7 +26,6 @@ class ReplayBuffer:
         self.buffer = []
         self.position = 0
 
-
     def push(self, data_dict):
         if len(self.buffer) < self.capacity:
             self.buffer.append(None)
@@ -48,11 +47,9 @@ class Simulator:
 
         config = AutoConfig.from_pretrained('./config.json')
 
-        # Training Model
         self.model = AutoModelForCausalLM.from_config(config).to(self.device)
         self.model.load_state_dict(torch.load('GEN-17600000.pt', map_location=self.device, weights_only=True))
 
-        # Reference Model for KL Divergence
         self.ref_model = AutoModelForCausalLM.from_config(config).to(self.device)
         self.ref_model.load_state_dict(torch.load('GEN-17600000.pt', map_location=self.device, weights_only=True))
         self.ref_model.eval()
@@ -77,11 +74,11 @@ class Simulator:
         self.allin_token_id = self.allin_token.item()
         self.fold_token_id = self.fold_token.item()
 
-        self.min_size_token_id = self.tokenizer.encode("<b1%>")[0]
+        self.min_size_token_id = self.tokenizer.encode("<xxx>")[0]
         self.min_size_token = torch.tensor([self.min_size_token_id]).to(self.device)
 
-        # Core Tokens
-        self.hero_token_ids = torch.tensor([self.tokenizer.encode(f"<herop{i}>")[0] for i in range(6)], device=self.device)
+        self.hero_token_ids = torch.tensor([self.tokenizer.encode(f"<xxx{i}>")[0] for i in range(6)], device=self.device)
+        print(self.hero_token_ids)
         self.action_tokens = {
             'fold': self.fold_token_id,
             'check': self.check_token_id,
@@ -90,18 +87,15 @@ class Simulator:
             'allin': self.allin_token_id
         }
 
-        # Token-Space Regret Supports
         self.sizes = np.array(list(range(1, 5)) + list(range(5, 101, 5)) + list(range(125, 501, 25)), dtype=np.float32)
         self.torch_sizes_float = torch.tensor(self.sizes).to(self.device).float()
         self.sizes_floats = self.torch_sizes_float.tolist()
 
-        # Optimizer
         self.optimizer = schedulefree.AdamWScheduleFree(
             self.model.parameters(), lr=1e-6, warmup_steps=0, betas=(0.9, 0.999), weight_decay=0.01
         )
         self.optimizer.train()
 
-        # Engine Params
         self.n_sims = 16
         self.batch_size = 64
         self.global_updates = 0
@@ -130,7 +124,6 @@ class Simulator:
             big_blind = float(hand.big_blind) if hand.big_blind > 0 else 1.0
 
             for node_data in hero_ev_data[i]:
-                # Unpack the temporally frozen state and its perfectly aligned EVs
                 state_json = node_data['state_json']
                 ev_dict = node_data['evs']
 
@@ -141,7 +134,6 @@ class Simulator:
                 encoded_str = self.encoder.encode(state_json)
                 base_encoded = f"{encoded_str}<herop{hero_idx}>"
 
-                # Feed the frozen ev_dict directly into the means calculation
                 means = {
                     act_str: float(np.mean(samples)) / big_blind
                     for act_str, samples in ev_dict.items()
@@ -154,7 +146,6 @@ class Simulator:
                 scores = np.array([means[a] for a in acts])
                 max_score = np.max(scores)
 
-                # Package the immutable environment data
                 chosen_act = np.random.choice(acts)
                 experience = {
                     'strategy_text': base_encoded,
@@ -171,18 +162,15 @@ class Simulator:
         beta = 1.0
 
         while self.global_updates < 40000:
-            # Sequentially generate a batch of rollouts and push them to disk history
             try:
                 self.generate_experience()
             except Exception as e:
                 print(f"Generator Exception: {e}")
                 traceback.print_exc()
 
-            # Wait until buffer has enough history
             if len(self.replay_buffer) < self.batch_size:
                 continue
 
-            # Sample randomly from the entire history
             samples = self.replay_buffer.sample(self.batch_size)
 
             batch_data = {
@@ -193,7 +181,6 @@ class Simulator:
                 'regret_targets': [s['regret_target'] for s in samples]
             }
 
-            # Strategy Forward Pass
             strat_inputs = self.tokenizer(batch_data['strategy_text'], padding=True, return_tensors="pt")
             strat_ids = strat_inputs.input_ids.to(self.device, non_blocking=True)
             strat_mask = strat_inputs.attention_mask.to(self.device, non_blocking=True)
@@ -201,9 +188,15 @@ class Simulator:
             with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
                 strat_logits = self.model(strat_ids, attention_mask=strat_mask).logits.float()
 
-            s_preds = strat_logits[:, -1, :]
+            with torch.no_grad(), torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+                ref_strat_logits = self.ref_model(strat_ids, attention_mask=strat_mask).logits.float()
 
-            # Isolate strictly the 5 action logits
+            is_hero = torch.isin(strat_ids, self.hero_token_ids)
+            seq_indices = torch.arange(strat_ids.size(1), device=self.device).unsqueeze(0).expand_as(strat_ids)
+            last_hero_indices = (is_hero.long() * seq_indices).max(dim=1).values
+
+            s_preds = strat_logits[torch.arange(self.batch_size), last_hero_indices, :]
+
             action_ids_list = [self.fold_token_id, self.check_token_id, self.call_token_id, self.raise_token_id, self.allin_token_id]
             action_tensor = torch.tensor(action_ids_list, device=self.device)
             s_preds_actions = s_preds[:, action_tensor]
@@ -218,18 +211,14 @@ class Simulator:
                     scores = np.array(batch_data['ev_scores'][b])
                     max_score = np.max(scores)
 
-                    # Map legal actions to our 5-dim tensor
                     local_indices = [action_ids_list.index(self.action_tokens[act]) for act in acts]
                     illegal_mask[b, local_indices] = False
 
-                    # Extract CURRENT model probabilities for calculating v_s
                     valid_logits = s_preds_actions[b, local_indices]
                     valid_probs = F.softmax(valid_logits, dim=-1).cpu().numpy()
 
-                    # Calculate Expected Value of the CURRENT policy
                     v_s = np.sum(valid_probs * scores)
 
-                    # Calculate Instantaneous Regrets dynamically
                     regrets = np.maximum(scores - v_s, 0)
                     regret_sum = np.sum(regrets)
 
@@ -241,22 +230,92 @@ class Simulator:
 
                     for i, idx in enumerate(local_indices):
                         s_targets_actions[b, idx] = target_probs[i]
+                    temp_scores = copy.deepcopy(scores)
+                    temp_scores.sort()
+                    if len(temp_scores) > 2:
+                        temp_scores = temp_scores[:-1]
 
-                    # Baseline weight of 1.0, max weight of ~8.0 for massive river mistakes
-                    ev_spread = max_score - np.min(scores)
-                    weight = float(ev_spread) + 1e-3  # Tiny floor to prevent strict zero division
+                    ev_spread = max_score - np.mean(temp_scores)
+                    ev_spread = max(float(ev_spread), 0.0)
+
+                    weight = float(np.sqrt(ev_spread)) + 1.0
                     dynamic_weights.append(weight)
 
-            s_preds_actions = s_preds_actions.masked_fill(illegal_mask, -1e2)
+            s_preds_actions = s_preds_actions.masked_fill(illegal_mask, -1e4)
 
             s_loss_unreduced = F.cross_entropy(s_preds_actions, s_targets_actions, reduction='none')
 
-            # Apply normalized dynamic weights
             batch_weights = torch.tensor(dynamic_weights, device=self.device)
             batch_weights = batch_weights / batch_weights.mean()
             s_loss = torch.mean(s_loss_unreduced * batch_weights)
 
-            total_loss = s_loss
+            shift_logits_train = strat_logits[..., :-1, :].contiguous()
+            shift_logits_ref = ref_strat_logits[..., :-1, :].contiguous()
+
+            kl_mask = strat_mask[..., :-1].contiguous().bool()
+
+            batch_indices = torch.arange(self.batch_size, device=self.device)
+            
+            valid_kl_indices = last_hero_indices < kl_mask.size(1)
+            kl_mask[batch_indices[valid_kl_indices], last_hero_indices[valid_kl_indices]] = False
+
+            kl_loss_unreduced = F.kl_div(
+                F.log_softmax(shift_logits_train, dim=-1),
+                F.softmax(shift_logits_ref, dim=-1),
+                reduction='none'
+            ).sum(dim=-1)
+
+            kl_loss = (kl_loss_unreduced * kl_mask).sum() / kl_mask.sum().clamp(min=1.0)
+            """
+            # 4. Token-Space Regret
+            reg_inputs = self.tokenizer(batch_data['regret_text'], padding=True, return_tensors="pt")
+            reg_ids = reg_inputs.input_ids.to(self.device, non_blocking=True)
+            reg_mask = reg_inputs.attention_mask.to(self.device, non_blocking=True)
+            reg_mask[:, -1] = 1
+
+            with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+                reg_logits = self.model(reg_ids, attention_mask=reg_mask).logits.float()
+
+            r_preds = reg_logits[:, -1, :]
+
+            target_classes = [
+                (torch.abs(self.torch_sizes_float - (float(reg) + 1.0))).argmin().item()
+                for reg in batch_data['regret_targets']
+            ]
+            target_tensor = torch.tensor(target_classes, device=self.device, dtype=torch.long)
+
+            start_idx = self.min_size_token_id
+            end_idx = start_idx + len(self.sizes)
+            b_token_preds = r_preds[:, start_idx:end_idx]
+
+            probs = F.softmax(b_token_preds, dim=-1)
+            cdf_pred = torch.cumsum(probs, dim=-1)
+
+            batch_size, num_classes = b_token_preds.shape
+            indices = torch.arange(num_classes, device=self.device).expand(batch_size, -1)
+            cdf_target = (indices >= target_tensor.unsqueeze(1)).float()
+
+            # 4. Calculate the distances between your specific token bins
+            # Normalize by 500.0 to match the magnitude of cross-entropy
+            bin_distances = torch.diff(self.torch_sizes_float) / 500.0
+
+            # 5. Weighted 1D Wasserstein Loss
+            cdf_diff = torch.abs(cdf_pred[:, :-1] - cdf_target[:, :-1])
+
+            # FIX: Unpack the mean and multiply by the normalized node weights
+            r_loss_unreduced = torch.sum(cdf_diff * bin_distances, dim=-1)
+            r_loss = torch.mean(r_loss_unreduced * batch_weights)
+            """
+            """
+            print("--- TENSOR MAPPING ---")
+            print(f"Targets (5-dim): {s_targets_actions[0].tolist()}")
+            print(f"Illegal Mask: {illegal_mask[0].tolist()}")
+            print(f"Pre-loss Logits: {s_preds_actions[0].tolist()}")
+            print(f"Applied Node Weight (Normalized): {batch_weights[0].item():.4f}")
+            print(f"Unreduced Cross Entropy Loss: {s_loss_unreduced[0].item():.4f}")
+            """
+            total_loss = s_loss + kl_loss  # + r_loss + (beta * kl_loss)
+
             if total_loss.requires_grad:
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -265,13 +324,14 @@ class Simulator:
 
             self.global_updates += 1
             if self.global_updates % 10 == 0:
-                self.csv_writer.writerow([self.global_updates, total_loss.item(), s_loss.item()])
+                self.csv_writer.writerow([self.global_updates, total_loss.item(), s_loss.item()])  # , r_loss.item()])
                 self.log_file.flush()
 
             if self.global_updates % 100 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
-                print(f"Upd {self.global_updates} | Total: {total_loss.item():.4f} (Strat: {s_loss.item():.4f})")
+                print(f"Upd {self.global_updates} | Total: {total_loss.item():.4f} (Strat: {s_loss.item():.4f}, KL: {kl_loss.item():.4f}")  # , Reg: {r_loss.item():.4f}) | Buf: {len(self.replay_buffer)}")
+
                 self.model.eval()
                 torch.save(self.model.state_dict(), f"RL-{self.global_updates}.pt")
                 self.model.train()
@@ -289,7 +349,8 @@ class Simulator:
 
             for i, idx in enumerate(active_indices):
                 hand = hands[idx]
-                if not hand.done and hand.state.turn_index == hero_indices[idx] and hand.state.street_index >= street_cutoff:
+                if not hand.done and hand.state.turn_index == hero_indices[
+                    idx] and hand.state.street_index >= street_cutoff:
                     ev_indices.append(idx)
                     ev_hand_objs.append(hand)
 
@@ -359,7 +420,6 @@ class Simulator:
             max_bet = action_space.get('max_bet', 0)
             valid_actions = {'fold', 'check', 'call', 'min_bet', 'max_bet'}
 
-            # Mirror the exact boolean logic from process_hand_cpu
             can_raise = 'min_bet' in action_space
             if can_raise and action_space['min_bet'] >= max_bet:
                 can_raise = False
@@ -367,14 +427,11 @@ class Simulator:
             can_call = 'call' in action_space
             call_is_allin = can_call and not can_raise
 
-            # Discard branches based strictly on the synchronized logic
             if not can_raise:
                 valid_actions.discard('min_bet')
 
             if call_is_allin:
-                # If call is a forced all-in, discard max_bet to prevent duplicate tree simulation
                 valid_actions.discard('max_bet')
-            # ---------------------------------
 
             for root_action in action_space.keys():
                 if root_action not in valid_actions or root_action == 'fold':
@@ -401,7 +458,8 @@ class Simulator:
                         sim_clone = copy.deepcopy(temp_hand)
                         sim_clone.shuffle()
                         all_sims.append(sim_clone)
-                    registry.append({'start': start_idx, 'count': self.n_sims, 'player': player, 'action': root_action, 'is_calc': True})
+                    registry.append({'start': start_idx, 'count': self.n_sims, 'player': player, 'action': root_action,
+                                     'is_calc': True})
                     res[root_action] = "PENDING"
 
         active_sim_indices = list(range(len(all_sims)))
@@ -430,7 +488,6 @@ class Simulator:
                         sim.call()
                 elif act == 'raise':
                     action_space = sim.get_action_space()
-                    # Keep the threshold here ONLY for environment execution
                     if sz >= (0.5 * action_space.get('max_bet', 0)):
                         sim.bet_or_raise(action_space.get('max_bet', 0))
                     else:
@@ -463,7 +520,6 @@ class Simulator:
             action_space = hand.get_action_space()
             max_bet = action_space.get('max_bet', 0)
 
-            # Re-evaluate the booleans to ensure final token mapping is completely gapless
             can_raise = 'min_bet' in action_space
             if can_raise and action_space['min_bet'] >= max_bet:
                 can_raise = False
@@ -476,13 +532,10 @@ class Simulator:
             if 'max_bet' in final_output[i]:
                 final_output[i]['allin'] = final_output[i].pop('max_bet')
 
-            # If the inference mask forces a call to be an allin, the target must also be an allin
             if call_is_allin and 'call' in final_output[i]:
                 final_output[i]['allin'] = final_output[i].pop('call')
-            # ---------------------------------
 
         return final_output
-
 
     @torch.inference_mode()
     def select_raise_batch(self, hands):
@@ -490,23 +543,24 @@ class Simulator:
 
         results = [self.process_hand_cpu(hand) for hand in hands]
         encoded_strs, min_bet_tokens, max_bets, pot_sizes, _, _, _, _, actor_indices = zip(*results)
+        
+        queries = [f"{encoded_strs[i]}<herop{actor_indices[i]}><raise>" for i in range(len(hands))]
 
-        inputs = self.tokenizer(list(encoded_strs), padding=True, return_tensors="pt")
-
+        inputs = self.tokenizer(queries, padding=True, return_tensors="pt")
         input_ids = inputs.input_ids.to(self.device, non_blocking=True)
         attention_mask = inputs.attention_mask.to(self.device, non_blocking=True)
-        batch_actor_tokens = self.hero_token_ids[list(actor_indices)].to(self.device)
-        raise_col = torch.full((len(hands), 1), self.raise_token_id, device=self.device, dtype=torch.long)
 
-        final_input_ids = torch.cat([input_ids, batch_actor_tokens.unsqueeze(1), raise_col], dim=1)
-        extension_mask = torch.ones((len(hands), 2), device=self.device, dtype=torch.long)
-        final_attention_mask = torch.cat([attention_mask, extension_mask], dim=1)
+        logits = self.model(input_ids, attention_mask=attention_mask).logits
 
-        logits = self.model(final_input_ids, attention_mask=final_attention_mask).logits[:, -1, :]
+        raise_col = torch.full((len(hands),), self.raise_token_id, device=self.device, dtype=torch.long)
+        is_raise = (input_ids == raise_col.unsqueeze(1))
+        seq_indices = torch.arange(input_ids.size(1), device=self.device).unsqueeze(0).expand_as(input_ids)
+        last_raise_indices = (is_raise.long() * seq_indices).max(dim=1).values
 
         start_id = self.min_size_token.item()
         num_sizes = len(self.sizes_floats)
-        size_logits = logits[:, start_id: start_id + num_sizes]
+
+        size_logits = logits[torch.arange(len(hands)), last_raise_indices, start_id: start_id + num_sizes]
 
         batch_min_tokens = torch.tensor(min_bet_tokens, device=self.device)
         offsets = (batch_min_tokens - start_id).unsqueeze(1)
@@ -523,11 +577,6 @@ class Simulator:
             for amt, cap in zip(bets.tolist(), max_bets)
         ]
 
-        del inputs, input_ids, attention_mask, batch_actor_tokens, raise_col
-        del final_input_ids, extension_mask, final_attention_mask, logits
-        del size_logits, batch_min_tokens, offsets, size_indices, relative_indices
-        del chosen_percents, bets
-
         return final_bets
 
     @torch.inference_mode()
@@ -543,13 +592,17 @@ class Simulator:
         input_ids = inputs.input_ids.to(self.device, non_blocking=True)
         attention_mask = inputs.attention_mask.to(self.device, non_blocking=True)
 
-        logits = self.model(input_ids, attention_mask=attention_mask).logits[:, -1, :]
+        logits = self.model(input_ids, attention_mask=attention_mask).logits
+
+        is_hero = torch.isin(input_ids, self.hero_token_ids)
+        seq_indices = torch.arange(input_ids.size(1), device=self.device).unsqueeze(0).expand_as(input_ids)
+        last_hero_indices = (is_hero.long() * seq_indices).max(dim=1).values
 
         action_keys = ['fold', 'check', 'call', 'raise', 'allin']
         action_ids = [self.fold_token_id, self.check_token_id, self.call_token_id, self.raise_token_id, self.allin_token_id]
         action_tensor = torch.tensor(action_ids, device=self.device)
 
-        action_logits = logits[:, action_tensor]
+        action_logits = logits[torch.arange(len(hands)), last_hero_indices, :][:, action_tensor]
 
         final_actions = [''] * len(hands)
         final_sizes = [0] * len(hands)
@@ -567,12 +620,8 @@ class Simulator:
             if can_raise[i]: legal_mask[3] = True
             if max_bets[i] > 0 or call_is_allin[i]: legal_mask[4] = True
 
-            #action_logits[i].masked_fill_(~legal_mask, float('-inf'))
-
-            # DO NOT mask the logits with -inf
         action_probs = F.softmax(action_logits, dim=-1)
 
-        # Apply the legal mask directly to the probabilities
         legal_mask_tensor = torch.stack([
             torch.tensor([
                 not can_check[i],  # fold
@@ -583,10 +632,8 @@ class Simulator:
             ], device=self.device) for i in range(len(hands))
         ])
 
-        # Zero out illegal probabilities
         action_probs = action_probs * legal_mask_tensor.float()
 
-        # Re-normalize so they sum back to 1.0 safely
         sum_probs = action_probs.sum(dim=-1, keepdim=True)
         action_probs = torch.where(sum_probs > 0, action_probs / sum_probs, legal_mask_tensor.float() / legal_mask_tensor.sum(dim=-1, keepdim=True))
 
