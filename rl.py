@@ -12,42 +12,64 @@ sys.modules["markupsafe._speedups"] = None
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 import schedulefree
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from sim_hand import Hand
 from sim_encoder import Encoder
+import threading
+import queue
+import concurrent.futures
 
+
+class ThreadSafeCounter:
+    def __init__(self):
+        self.value = 0
+        self.lock = threading.Lock()
+
+    def get(self):
+        with self.lock:
+            return self.value
+
+    def increment(self):
+        with self.lock:
+            self.value += 1
 
 class Simulator:
     def __init__(self):
         self.device = 'cuda'
         torch.set_float32_matmul_precision('high')
+        self.thread_local = threading.local()
 
         config = AutoConfig.from_pretrained('./config.json')
 
-        # Training Model
         self.model = AutoModelForCausalLM.from_config(config).to(self.device)
         self.model.load_state_dict(torch.load('GEN-17600000.pt', map_location=self.device, weights_only=True))
+        self.model.share_memory()
 
-        self.tokenizer = AutoTokenizer.from_pretrained('./opt-it-2')
-        self.tokenizer.padding_side = "left"
-        self.tokenizer.pad_token = self.tokenizer.unk_token
+        self.ref_model = AutoModelForCausalLM.from_config(config).to(self.device)
+        self.ref_model.load_state_dict(torch.load('GEN-17600000.pt', map_location=self.device, weights_only=True))
+        self.ref_model.eval()
+        self.ref_model.requires_grad_(False)
+        self.ref_model.share_memory()
 
-        # Action Tokens
-        self.fold_token_id = self.tokenizer.encode("<xxx>")[0]
-        self.check_token_id = self.tokenizer.encode("<xxx>")[0]
-        self.call_token_id = self.tokenizer.encode("<xxx>")[0]
-        self.raise_token_id = self.tokenizer.encode("<xxx>")[0]
-        self.allin_token_id = self.tokenizer.encode("<xxx>")[0]
 
-        self.min_size_token_id = self.tokenizer.encode("<xxx>")[0]
+        base_tokenizer = AutoTokenizer.from_pretrained('./opt-it-2')
+        base_tokenizer.padding_side = "left"
+        base_tokenizer.pad_token = base_tokenizer.unk_token
+
+        self.fold_token_id = base_tokenizer.encode("<xxx>")[0]
+        self.check_token_id = base_tokenizer.encode("<xxx>")[0]
+        self.call_token_id = base_tokenizer.encode("<xxx>")[0]
+        self.raise_token_id = base_tokenizer.encode("<xxx>")[0]
+        self.allin_token_id = base_tokenizer.encode("<xxx>")[0]
+
+        self.min_size_token_id = base_tokenizer.encode("<xxx>")[0]
         self.min_size_token = torch.tensor([self.min_size_token_id]).to(self.device)
 
-        # Core Tokens mapping
-        self.hero_token_ids = torch.tensor([self.tokenizer.encode(f"<xxx{i}>")[0] for i in range(6)],
-                                           device=self.device)
+        self.hero_token_ids = torch.tensor([base_tokenizer.encode(f"<xxx{i}>")[0] for i in range(6)], device=self.device)
         self.action_tokens = {
             'fold': self.fold_token_id,
             'check': self.check_token_id,
@@ -56,33 +78,57 @@ class Simulator:
             'allin': self.allin_token_id
         }
 
-        # Token-Space Regret Supports (Needed for inference sizes)
-        self.sizes = np.array(list(range(1, 5))..., dtype=np.float32)
+        # Token-Space Regret Supports
+        self.sizes = np.array(list(range(1, 5))...
         self.torch_sizes_float = torch.tensor(self.sizes).to(self.device).float()
         self.sizes_floats = self.torch_sizes_float.tolist()
 
-        # Optimizer
         self.optimizer = schedulefree.AdamWScheduleFree(
-            self.model.parameters(), lr=1e-6, warmup_steps=0, betas=(0.9, 0.999), weight_decay=0.01
+            self.model.parameters(),
+            lr=1e-6,
+            warmup_steps=0,
+            betas=(0.9, 0.999),
+            weight_decay=0.0  #Disabled to prevent logit compression
         )
         self.optimizer.train()
 
-        # Engine Params
         self.n_sims = 16
         self.batch_size = 64
         self.global_updates = 0
 
-        # Direct List Memory (No Buffer Logic)
-        self.batch_memory = []
-        self.encoder = Encoder()
 
-        self.log_file = open('training_logs.csv', mode='w', newline='')
-        self.csv_writer = csv.writer(self.log_file)
-        self.csv_writer.writerow(['Update', 'Strategy_Loss'])
 
-    def generate_experience(self):
-        # Default cutoffs for simplified generation
-        hands, hero_ev_data, hero_indices = self.batch_generate_hands(self.batch_size, street_cutoff=3)
+    @property
+    def tokenizer(self):
+        """Lazily instantiates and caches a Tokenizer specific to the calling thread."""
+        if not hasattr(self.thread_local, 'tokenizer'):
+            tok = AutoTokenizer.from_pretrained('./opt-it-2')
+            tok.padding_side = "left"
+            tok.pad_token = tok.unk_token
+            self.thread_local.tokenizer = tok
+        return self.thread_local.tokenizer
+
+    @property
+    def encoder(self):
+        """Lazily instantiates and caches an Encoder specific to the calling thread."""
+        if not hasattr(self.thread_local, 'encoder'):
+            self.thread_local.encoder = Encoder()
+        return self.thread_local.encoder
+
+    @property
+    def encoders(self):
+        """Lazily instantiates and caches batch of encoders specific to the calling thread."""
+        if not hasattr(self.thread_local, 'encoders'):
+            encoders = []
+            for i in range(self.batch_size):
+                encoders.append(Encoder())
+            self.thread_local.encoders = encoders
+        return self.thread_local.encoders
+
+    def generate_experience(self, current_train_count):
+        """Generates a chunk of experiences tagged with the current train_count"""
+        hands, hero_ev_data, hero_indices, full_seqs = self.batch_generate_hands(self.batch_size, street_cutoff=3)
+        experiences = []
 
         for i, hand in enumerate(hands):
             if not hero_ev_data[i]: continue
@@ -101,6 +147,8 @@ class Simulator:
                 encoded_str = self.encoder.encode(state_json)
                 base_encoded = f"{encoded_str}<herop{hero_idx}>"
 
+                decision_token_count = base_encoded.count('<')
+
                 means = {
                     act_str: float(np.mean(samples)) / big_blind
                     for act_str, samples in ev_dict.items()
@@ -111,146 +159,155 @@ class Simulator:
 
                 acts = list(means.keys())
                 scores = np.array([means[a] for a in acts])
-                max_score = np.max(scores)
 
                 experience = {
-                    'strategy_text': base_encoded,
+                    'full_text': full_seqs[i],
+                    'decision_token_count': decision_token_count,
                     'legal_actions': acts,
-                    'ev_scores': scores.tolist()
+                    'ev_scores': scores.tolist(),
+                    'train_count': current_train_count
                 }
+                experiences.append(experience)
 
-                self.batch_memory.append(experience)
+        return experiences
 
-    def verify_and_log_state(self,text, b_idx, acts, scores, valid_probs, targets, loss, weight):
-        """Helper to print out exactly what the model sees and targets for one sample."""
-        print(f"\n--- STATE AUTOMATA VERIFICATION (Batch Index {b_idx}) ---")
-        print(f"text: {text}")
-        print(f"Legal Actions available: {acts}")
-        print(f"Raw EV Scores: {scores}")
-        print(f"Current Model Probs (Normalized over valid): {valid_probs.tolist()}")
-        print(f"Assigned Targets: {targets.tolist()}")
-        print(f"Node EV Spread Weight: {weight:.4f}")
-        print(f"Resulting Unreduced CE Loss: {loss.item():.4f}")
-        print("---------------------------------------------------------")
+    def worker_loop(self, worker_id, q, train_count_obj):
+        """Generator thread loop that continuously fills the queue."""
+        print(f"Generator Thread {worker_id} started.")
+        self.model.eval()
 
-    def rl(self):
-        print("Starting Simplified Joint Training...")
+        while True:
+            try:
+                current_tc = train_count_obj.get()
+
+                with torch.no_grad():
+                    experiences = self.generate_experience(current_tc)
+
+                for exp in experiences:
+                    q.put(exp)
+            except Exception as e:
+                print(f"Generator {worker_id} Exception: {e}")
+                traceback.print_exc()
+
+    def run_trainer(self, q, train_count_obj):
+        """Main training loop."""
+        print("Starting Central Trainer Loop...")
+
+        log_file = open('training_logs.csv', mode='w', newline='')
+        csv_writer = csv.writer(log_file)
+        csv_writer.writerow(['Update', 'Strategy_Loss', 'KL_Loss'])
+
+        batch_memory = []
 
         while self.global_updates < 40000:
-            # Generate until we have enough for a pure sequential batch
-            while len(self.batch_memory) < self.batch_size:
-                try:
-                    self.generate_experience()
-                except Exception as e:
-                    print(f"Generator Exception: {e}")
-                    traceback.print_exc()
 
-            # Slice exact batch and clear from memory
-            batch_samples = self.batch_memory[:self.batch_size]
-            self.batch_memory = self.batch_memory[self.batch_size:]
+            while len(batch_memory) < self.batch_size:
+                try:
+                    exp = q.get(timeout=1)
+
+                    if exp['train_count'] == train_count_obj.get():
+                        batch_memory.append(exp)
+                except queue.Empty:
+                    continue
+
+            batch_samples = batch_memory[:self.batch_size]
+            batch_memory = batch_memory[self.batch_size:]
 
             batch_data = {
-                'strategy_text': [s['strategy_text'] for s in batch_samples],
+                'full_text': [s['full_text'] for s in batch_samples],
+                'decision_token_count': [s['decision_token_count'] for s in batch_samples],
                 'legal_actions': [s['legal_actions'] for s in batch_samples],
                 'ev_scores': [s['ev_scores'] for s in batch_samples]
             }
 
-            # Strategy Forward Pass
-            strat_inputs = self.tokenizer(batch_data['strategy_text'], padding=True, return_tensors="pt")
-            strat_ids = strat_inputs.input_ids.to(self.device, non_blocking=True)
-            strat_mask = strat_inputs.attention_mask.to(self.device, non_blocking=True)
+            inputs = self.tokenizer(batch_data['full_text'], padding=True, return_tensors="pt")
+            input_ids = inputs.input_ids.to(self.device, non_blocking=True)
+            attention_mask = inputs.attention_mask.to(self.device, non_blocking=True)
 
+            left_pad_offsets = input_ids.size(1) - attention_mask.sum(dim=1)
+            prefix_lens = torch.tensor(batch_data['decision_token_count'], device=self.device)
+            exact_decision_indices = left_pad_offsets + prefix_lens - 1
+
+            self.model.train()
             with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
-                strat_logits = self.model(strat_ids, attention_mask=strat_mask).logits.float()
+                active_logits = self.model(input_ids, attention_mask=attention_mask).logits.float()
 
-            is_hero = torch.isin(strat_ids, self.hero_token_ids)
-            seq_indices = torch.arange(strat_ids.size(1), device=self.device).unsqueeze(0).expand_as(strat_ids)
-            last_hero_indices = (is_hero.long() * seq_indices).max(dim=1).values
+                with torch.no_grad():
+                    ref_logits = self.ref_model(input_ids, attention_mask=attention_mask).logits.float()
 
-            s_preds = strat_logits[torch.arange(self.batch_size), last_hero_indices, :]
-            s_targets = torch.zeros_like(s_preds)
-            dynamic_weights = []
+                s_preds = active_logits[torch.arange(self.batch_size), exact_decision_indices, :]
+                s_targets = torch.zeros_like(s_preds)
+                dynamic_weights = []
 
-            debug_batch_idx = 0 if self.global_updates % 50 == 0 else -1
+                s_preds_masked = s_preds.clone()
 
-            with torch.no_grad():
-                for b in range(self.batch_size):
-                    acts = batch_data['legal_actions'][b]
-                    scores = np.array(batch_data['ev_scores'][b])
-                    max_score = np.max(scores)
+                with torch.no_grad():
+                    for b in range(self.batch_size):
+                        acts = batch_data['legal_actions'][b]
+                        scores = np.array(batch_data['ev_scores'][b])
 
-                    local_action_ids = [self.action_tokens[act] for act in acts]
+                        max_score = np.max(scores)
+                        min_score = np.min(scores)
 
-                    # Extract CURRENT model probabilities strictly normalized over legal actions
-                    valid_logits = s_preds[b, local_action_ids]
-                    valid_probs = F.softmax(valid_logits, dim=-1).cpu().numpy()
-
-                    # Expected Value of the CURRENT policy V(s)
-                    v_s = np.sum(valid_probs * scores)
-
-                    # Dynamic Target Calculation
-                    regrets = np.maximum(scores - v_s, 0)
-                    regret_sum = np.sum(regrets)
-
-                    if regret_sum > 0:
-                        target_probs = regrets / regret_sum
-                    else:
                         best_acts = (scores >= max_score - 1e-4)
                         target_probs = best_acts.astype(float) / np.sum(best_acts)
 
-                    # Inject targets into full vocabulary space
-                    for i, act_id in enumerate(local_action_ids):
-                        s_targets[b, act_id] = target_probs[i]
-                    # max_score is the best possible EV.
-                    # v_s is the expected EV of the model's current probabilities.
-                    policy_regret = max_score - v_s
-                    weight = float(policy_regret) + 1e-3
-                    dynamic_weights.append(weight)
+                        local_action_ids = [self.action_tokens[act] for act in acts]
+                        for i, act_id in enumerate(local_action_ids):
+                            s_targets[b, act_id] = target_probs[i]
 
-                    if b == debug_batch_idx:
-                        debug_valid_probs = valid_probs
-                        debug_targets = target_probs
+                        illegal_mask = torch.ones(s_preds.size(-1), dtype=torch.bool, device=self.device)
+                        illegal_mask[local_action_ids] = False
+                        s_preds_masked[b, illegal_mask] = -10000.0
 
-            # Calculate Cross Entropy over the full distribution
-            s_loss_unreduced = F.cross_entropy(s_preds, s_targets, reduction='none')
+                        node_spread = max_score - min_score
+                        weight = float(node_spread) + 1e-3
+                        dynamic_weights.append(weight)
 
-            # Normalize and apply batch weights
-            batch_weights = torch.tensor(dynamic_weights, device=self.device)
-            batch_weights = batch_weights / batch_weights.mean()
-            s_loss = torch.mean(s_loss_unreduced * batch_weights)
+                s_loss_unreduced = F.cross_entropy(s_preds_masked, s_targets, reduction='none')
 
-            if debug_batch_idx != -1:
-                self.verify_and_log_state(
-                    text=batch_data['strategy_text'][debug_batch_idx],
-                    b_idx=debug_batch_idx,
-                    acts=batch_data['legal_actions'][debug_batch_idx],
-                    scores=np.array(batch_data['ev_scores'][debug_batch_idx]),
-                    valid_probs=debug_valid_probs,  # Use the captured variable
-                    targets=debug_targets,
-                    loss=s_loss_unreduced[debug_batch_idx],
-                    weight=batch_weights[debug_batch_idx].item()
-                )
+                batch_weights = torch.tensor(dynamic_weights, device=self.device)
+                batch_weights = batch_weights / batch_weights.mean()
+                s_loss = torch.mean(s_loss_unreduced * batch_weights)
 
-            # Optimization Step
-            if s_loss.requires_grad:
-                s_loss.backward()
+                # KL Calculation 
+                kl_unreduced = F.kl_div(
+                    F.log_softmax(active_logits, dim=-1),
+                    F.softmax(ref_logits, dim=-1),
+                    reduction='none'
+                ).sum(dim=-1)
+
+                # Sequence-wide KL
+                masked_kl = kl_unreduced * attention_mask
+                seq_kl = masked_kl.sum() / attention_mask.sum()
+
+                # Decision-node KL
+                decision_kl = kl_unreduced[torch.arange(self.batch_size), exact_decision_indices].mean()
+
+                kl_loss = seq_kl + decision_kl
+                total_loss = s_loss + kl_loss
+
+            if total_loss.requires_grad:
+                total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+                
+            train_count_obj.increment()
 
             self.global_updates += 1
-            if self.global_updates % 10 == 0:
-                self.csv_writer.writerow([self.global_updates, s_loss.item()])
-                self.log_file.flush()
 
-            if self.global_updates % 100 == 0:
+            self.global_updates += 1
+
+            if self.global_updates % 10 == 0:
+                csv_writer.writerow([self.global_updates, s_loss.item(), kl_loss.item()])
+                log_file.flush()
+
+            if self.global_updates % 500 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
-                print(f"Upd {self.global_updates} | Strat Loss: {s_loss.item():.4f}")
-
-                self.model.eval()
+                print(f"Upd {self.global_updates} | Strat Loss: {s_loss.item():.4f} | kl Loss: {kl_loss.item():.4f}")
                 torch.save(self.model.state_dict(), f"RL-{self.global_updates}.pt")
-                self.model.train()
 
     def batch_generate_hands(self, n_hands, street_cutoff):
         hands = [Hand() for _ in range(n_hands)]
@@ -312,7 +369,26 @@ class Simulator:
 
             active_indices = next_active_indices
 
-        return hands, hero_ev_data, hero_indices
+        valid_indices = [i for i, evs in enumerate(hero_ev_data) if evs]
+
+        full_seqs = [""] * len(hands)  # Initialize with placeholders
+
+        if valid_indices:
+            current_encoders = self.encoders
+
+            def _encode_hand(encoder, hand, hero_idx):
+                return encoder.encode(json.dumps(hand.get_u_hand(hero_idx)), True, True)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(valid_indices)) as executor:
+                futures = [
+                    executor.submit(_encode_hand, current_encoders[idx], hands[idx], hero_indices[idx])
+                    for idx in valid_indices
+                ]
+
+                for idx, future in zip(valid_indices, futures):
+                    full_seqs[idx] = future.result()
+
+        return hands, hero_ev_data, hero_indices, full_seqs
 
     @torch.inference_mode()
     def generate_bulk_evs(self, hand_list, size_list):
@@ -382,8 +458,7 @@ class Simulator:
                         sim_clone = copy.deepcopy(temp_hand)
                         sim_clone.shuffle()
                         all_sims.append(sim_clone)
-                    registry.append({'start': start_idx, 'count': self.n_sims, 'player': player, 'action': root_action,
-                                     'is_calc': True})
+                    registry.append({'start': start_idx, 'count': self.n_sims, 'player': player, 'action': root_action, 'is_calc': True})
                     res[root_action] = "PENDING"
 
         active_sim_indices = list(range(len(all_sims)))
@@ -469,7 +544,7 @@ class Simulator:
         results = [self.process_hand_cpu(hand) for hand in hands]
         encoded_strs, min_bet_tokens, max_bets, pot_sizes, _, _, _, _, actor_indices = zip(*results)
 
-        queries = [f"{encoded_strs[i]}<xxx{actor_indices[i]}><xxx>" for i in range(len(hands))]
+        queries = [f"{encoded_strs[i]}<herop{actor_indices[i]}><raise>" for i in range(len(hands))]
 
         inputs = self.tokenizer(queries, padding=True, return_tensors="pt")
         input_ids = inputs.input_ids.to(self.device, non_blocking=True)
@@ -569,15 +644,12 @@ class Simulator:
             start_id = self.min_size_token.item()
             num_sizes = len(self.sizes_floats)
 
-            r_encoded = [encoded_strs[i] for i in raise_indexes]
-            r_inputs = self.tokenizer(r_encoded, padding=True, return_tensors="pt")
-            r_ids = r_inputs.input_ids.to(self.device, non_blocking=True)
-            r_mask = r_inputs.attention_mask.to(self.device, non_blocking=True)
-            r_actors = self.hero_token_ids[list(np.array(actor_indices)[raise_indexes])].to(self.device)
-            r_raise_tok = torch.full((len(raise_indexes), 1), self.raise_token_id, device=self.device)
+            r_queries = [f"{encoded_strs[i]}<herop{actor_indices[i]}><raise>" for i in raise_indexes]
 
-            r_final_ids = torch.cat([r_ids, r_actors.unsqueeze(1), r_raise_tok], dim=1)
-            r_final_mask = torch.cat([r_mask, torch.ones((len(raise_indexes), 2), device=self.device)], dim=1)
+            r_inputs = self.tokenizer(r_queries, padding=True, return_tensors="pt")
+
+            r_final_ids = r_inputs.input_ids.to(self.device, non_blocking=True)
+            r_final_mask = r_inputs.attention_mask.to(self.device, non_blocking=True)
 
             r_logits = self.model(r_final_ids, attention_mask=r_final_mask).logits[:, -1, :]
             size_logits = r_logits[:, start_id: start_id + num_sizes]
@@ -625,7 +697,38 @@ class Simulator:
             min_bet_token, max_bet, pot_size, can_check, can_raise, can_call, call_is_allin, turn_idx
         )
 
+    def verify_and_log_state(self,text, b_idx, acts, scores, valid_probs, targets, loss, weight):
+        """Helper to print out exactly what the model sees and targets for one sample."""
+        print(f"\n--- STATE AUTOMATA VERIFICATION (Batch Index {b_idx}) ---")
+        print(f"text: {text}")
+        print(f"Legal Actions available: {acts}")
+        print(f"Raw EV Scores: {scores}")
+        print(f"Current Model Probs (Normalized over valid): {valid_probs.tolist()}")
+        print(f"Assigned Targets: {targets.tolist()}")
+        print(f"Node EV Spread Weight: {weight:.4f}")
+        print(f"Resulting Unreduced CE Loss: {loss.item():.4f}")
+        print("---------------------------------------------------------")
+
 
 if __name__ == '__main__':
     sim = Simulator()
-    sim.rl()
+
+    experience_queue = queue.Queue(maxsize=sim.batch_size * 2)
+    global_train_count = ThreadSafeCounter()
+
+    num_generators = 4
+    threads = []
+
+    for i in range(num_generators):
+        t = threading.Thread(
+            target=sim.worker_loop,
+            args=(i, experience_queue, global_train_count),
+            daemon=True
+        )
+        t.start()
+        threads.append(t)
+
+    try:
+        sim.run_trainer(experience_queue, global_train_count)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted.")
