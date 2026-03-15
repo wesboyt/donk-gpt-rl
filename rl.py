@@ -69,7 +69,8 @@ class Simulator:
         self.min_size_token_id = base_tokenizer.encode("<xxx>")[0]
         self.min_size_token = torch.tensor([self.min_size_token_id]).to(self.device)
 
-        self.hero_token_ids = torch.tensor([base_tokenizer.encode(f"<xxx{i}>")[0] for i in range(6)], device=self.device)
+        self.hero_token_ids = torch.tensor([base_tokenizer.encode(f"<xxx>")[0] for i in range(6)],
+                                           device=self.device)
         self.action_tokens = {
             'fold': self.fold_token_id,
             'check': self.check_token_id,
@@ -78,8 +79,7 @@ class Simulator:
             'allin': self.allin_token_id
         }
 
-        # Token-Space Regret Supports
-        self.sizes = np.array(list(range(1, 5))...
+        self.sizes = np.array(list(range(1, 5))..., dtype=np.float32)
         self.torch_sizes_float = torch.tensor(self.sizes).to(self.device).float()
         self.sizes_floats = self.torch_sizes_float.tolist()
 
@@ -88,19 +88,18 @@ class Simulator:
             lr=1e-6,
             warmup_steps=0,
             betas=(0.9, 0.999),
-            weight_decay=0.0  #Disabled to prevent logit compression
+            weight_decay=0.0
         )
         self.optimizer.train()
 
-        self.n_sims = 16
-        self.batch_size = 64
+        self.n_sims = 8
+        self.batch_size = 8
         self.global_updates = 0
 
 
 
     @property
     def tokenizer(self):
-        """Lazily instantiates and caches a Tokenizer specific to the calling thread."""
         if not hasattr(self.thread_local, 'tokenizer'):
             tok = AutoTokenizer.from_pretrained('./opt-it-2')
             tok.padding_side = "left"
@@ -110,14 +109,12 @@ class Simulator:
 
     @property
     def encoder(self):
-        """Lazily instantiates and caches an Encoder specific to the calling thread."""
         if not hasattr(self.thread_local, 'encoder'):
             self.thread_local.encoder = Encoder()
         return self.thread_local.encoder
 
     @property
     def encoders(self):
-        """Lazily instantiates and caches batch of encoders specific to the calling thread."""
         if not hasattr(self.thread_local, 'encoders'):
             encoders = []
             for i in range(self.batch_size):
@@ -126,28 +123,20 @@ class Simulator:
         return self.thread_local.encoders
 
     def generate_experience(self, current_train_count):
-        """Generates a chunk of experiences tagged with the current train_count"""
-        hands, hero_ev_data, hero_indices, full_seqs = self.batch_generate_hands(self.batch_size, street_cutoff=3)
+        hands, hero_ev_data, hero_indices, full_seqs = self.batch_generate_hands(self.batch_size)
         experiences = []
 
         for i, hand in enumerate(hands):
             if not hero_ev_data[i]: continue
 
-            hero_idx = hero_indices[i]
             big_blind = float(hand.big_blind) if hand.big_blind > 0 else 1.0
 
+            hand_decision_counts = []
+            hand_legal_actions = []
+            hand_ev_scores = []
+
             for node_data in hero_ev_data[i]:
-                state_json = node_data['state_json']
                 ev_dict = node_data['evs']
-
-                parsed_uh = json.loads(state_json)
-                if not parsed_uh[0][hero_idx] or len(parsed_uh[1]) < 0:
-                    continue
-
-                encoded_str = self.encoder.encode(state_json)
-                base_encoded = f"{encoded_str}<herop{hero_idx}>"
-
-                decision_token_count = base_encoded.count('<')
 
                 means = {
                     act_str: float(np.mean(samples)) / big_blind
@@ -160,11 +149,16 @@ class Simulator:
                 acts = list(means.keys())
                 scores = np.array([means[a] for a in acts])
 
+                hand_decision_counts.append(node_data['decision_token_count'])
+                hand_legal_actions.append(acts)
+                hand_ev_scores.append(scores.tolist())
+
+            if hand_decision_counts:
                 experience = {
                     'full_text': full_seqs[i],
-                    'decision_token_count': decision_token_count,
-                    'legal_actions': acts,
-                    'ev_scores': scores.tolist(),
+                    'decision_token_counts': hand_decision_counts,
+                    'legal_actions': hand_legal_actions,
+                    'ev_scores': hand_ev_scores,
                     'train_count': current_train_count
                 }
                 experiences.append(experience)
@@ -172,7 +166,6 @@ class Simulator:
         return experiences
 
     def worker_loop(self, worker_id, q, train_count_obj):
-        """Generator thread loop that continuously fills the queue."""
         print(f"Generator Thread {worker_id} started.")
         self.model.eval()
 
@@ -190,12 +183,11 @@ class Simulator:
                 traceback.print_exc()
 
     def run_trainer(self, q, train_count_obj):
-        """Main training loop."""
         print("Starting Central Trainer Loop...")
 
         log_file = open('training_logs.csv', mode='w', newline='')
         csv_writer = csv.writer(log_file)
-        csv_writer.writerow(['Update', 'Strategy_Loss', 'KL_Loss'])
+        csv_writer.writerow(['Update', 'Strategy_Loss', 'KL_Loss', 'Penalty_Loss'])
 
         batch_memory = []
 
@@ -204,7 +196,6 @@ class Simulator:
             while len(batch_memory) < self.batch_size:
                 try:
                     exp = q.get(timeout=1)
-
                     if exp['train_count'] == train_count_obj.get():
                         batch_memory.append(exp)
                 except queue.Empty:
@@ -213,20 +204,34 @@ class Simulator:
             batch_samples = batch_memory[:self.batch_size]
             batch_memory = batch_memory[self.batch_size:]
 
-            batch_data = {
-                'full_text': [s['full_text'] for s in batch_samples],
-                'decision_token_count': [s['decision_token_count'] for s in batch_samples],
-                'legal_actions': [s['legal_actions'] for s in batch_samples],
-                'ev_scores': [s['ev_scores'] for s in batch_samples]
-            }
+            full_texts = [s['full_text'] for s in batch_samples]
 
-            inputs = self.tokenizer(batch_data['full_text'], padding=True, return_tensors="pt")
+            inputs = self.tokenizer(full_texts, padding=True, return_tensors="pt")
             input_ids = inputs.input_ids.to(self.device, non_blocking=True)
             attention_mask = inputs.attention_mask.to(self.device, non_blocking=True)
 
-            left_pad_offsets = input_ids.size(1) - attention_mask.sum(dim=1)
-            prefix_lens = torch.tensor(batch_data['decision_token_count'], device=self.device)
-            exact_decision_indices = left_pad_offsets + prefix_lens - 1
+            seq_len = input_ids.size(1)
+            unpadded_lengths_cpu = attention_mask.sum(dim=1).long().tolist()
+
+            batch_b_indices = []
+            batch_seq_indices = []
+            flat_legal_actions = []
+            flat_ev_scores = []
+
+            for b in range(self.batch_size):
+                counts = batch_samples[b]['decision_token_counts']
+                for i, count in enumerate(counts):
+                    pad_offset = seq_len - unpadded_lengths_cpu[b]
+                    token_idx = pad_offset + count - 1
+
+                    batch_b_indices.append(b)
+                    batch_seq_indices.append(token_idx)
+                    flat_legal_actions.append(batch_samples[b]['legal_actions'][i])
+                    flat_ev_scores.append(batch_samples[b]['ev_scores'][i])
+
+            b_idx_tensor = torch.tensor(batch_b_indices, device=self.device, dtype=torch.long)
+            seq_idx_tensor = torch.tensor(batch_seq_indices, device=self.device, dtype=torch.long)
+            total_nodes = len(batch_b_indices)
 
             self.model.train()
             with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
@@ -235,81 +240,116 @@ class Simulator:
                 with torch.no_grad():
                     ref_logits = self.ref_model(input_ids, attention_mask=attention_mask).logits.float()
 
-                s_preds = active_logits[torch.arange(self.batch_size), exact_decision_indices, :]
-                s_targets = torch.zeros_like(s_preds)
-                dynamic_weights = []
+            s_preds = active_logits[b_idx_tensor, seq_idx_tensor, :]
+            s_targets = torch.zeros_like(s_preds)
+            batch_illegal_mask = torch.ones_like(s_preds, dtype=torch.bool)
+            dynamic_weights = []
 
-                s_preds_masked = s_preds.clone()
+            with torch.no_grad():
+                max_acts = 5
+                padded_ids = np.zeros((total_nodes, max_acts), dtype=np.int64)
+                padded_scores = np.zeros((total_nodes, max_acts), dtype=np.float32)
+                valid_mask = np.zeros((total_nodes, max_acts), dtype=bool)
 
-                with torch.no_grad():
-                    for b in range(self.batch_size):
-                        acts = batch_data['legal_actions'][b]
-                        scores = np.array(batch_data['ev_scores'][b])
+                valid_b_indices = []
+                valid_act_indices = []
 
-                        max_score = np.max(scores)
-                        min_score = np.min(scores)
+                for n in range(total_nodes):
+                    acts = flat_legal_actions[n]
+                    scores = flat_ev_scores[n]
+                    local_ids = [self.action_tokens[act] for act in acts]
+                    num_acts = len(acts)
 
-                        best_acts = (scores >= max_score - 1e-4)
-                        target_probs = best_acts.astype(float) / np.sum(best_acts)
+                    padded_ids[n, :num_acts] = local_ids
+                    padded_ids[n, num_acts:] = local_ids[0]
+                    padded_scores[n, :num_acts] = scores
+                    valid_mask[n, :num_acts] = True
 
-                        local_action_ids = [self.action_tokens[act] for act in acts]
-                        for i, act_id in enumerate(local_action_ids):
-                            s_targets[b, act_id] = target_probs[i]
+                    valid_b_indices.extend([n] * num_acts)
+                    valid_act_indices.extend(local_ids)
 
-                        illegal_mask = torch.ones(s_preds.size(-1), dtype=torch.bool, device=self.device)
-                        illegal_mask[local_action_ids] = False
-                        s_preds_masked[b, illegal_mask] = -10000.0
+                    spread = max(scores) - min(scores)
+                    dynamic_weights.append(float(spread) + 1e-3)
 
-                        node_spread = max_score - min_score
-                        weight = float(node_spread) + 1e-3
-                        dynamic_weights.append(weight)
+                act_ids_tensor = torch.tensor(padded_ids, device=self.device, dtype=torch.long)
+                scores_tensor = torch.tensor(padded_scores, device=self.device, dtype=torch.float32)
+                valid_mask_tensor = torch.tensor(valid_mask, device=self.device, dtype=torch.bool)
 
-                s_loss_unreduced = F.cross_entropy(s_preds_masked, s_targets, reduction='none')
+                batch_illegal_mask[valid_b_indices, valid_act_indices] = False
 
-                batch_weights = torch.tensor(dynamic_weights, device=self.device)
-                batch_weights = batch_weights / batch_weights.mean()
-                s_loss = torch.mean(s_loss_unreduced * batch_weights)
+                current_probs_full = F.softmax(s_preds, dim=-1)
+                policy_probs = torch.gather(current_probs_full, 1, act_ids_tensor)
+                policy_probs = policy_probs * valid_mask_tensor.float()
 
-                # KL Calculation 
-                kl_unreduced = F.kl_div(
-                    F.log_softmax(active_logits, dim=-1),
-                    F.softmax(ref_logits, dim=-1),
-                    reduction='none'
-                ).sum(dim=-1)
+                prob_sums = policy_probs.sum(dim=-1, keepdim=True)
+                valid_counts = valid_mask_tensor.sum(dim=-1, keepdim=True).float()
+                uniform_probs = valid_mask_tensor.float() / valid_counts
+                policy_probs = torch.where(prob_sums > 0, policy_probs / prob_sums, uniform_probs)
 
-                # Sequence-wide KL
-                masked_kl = kl_unreduced * attention_mask
-                seq_kl = masked_kl.sum() / attention_mask.sum()
+                policy_ev = torch.sum(policy_probs * scores_tensor, dim=-1, keepdim=True)
+                regrets = scores_tensor - policy_ev
+                pos_regrets = torch.clamp(regrets, min=0.0) * valid_mask_tensor.float()
 
-                # Decision-node KL
-                decision_kl = kl_unreduced[torch.arange(self.batch_size), exact_decision_indices].mean()
+                sum_pos_regrets = torch.sum(pos_regrets, dim=-1, keepdim=True)
+                target_probs = torch.where(sum_pos_regrets > 0, pos_regrets / sum_pos_regrets, policy_probs)
 
-                kl_loss = seq_kl + decision_kl
-                total_loss = s_loss + kl_loss
+                masked_targets = target_probs * valid_mask_tensor.float()
+                s_targets.scatter_add_(1, act_ids_tensor, masked_targets)
+
+            s_preds_masked = torch.where(
+                batch_illegal_mask,
+                torch.tensor(-1000.0, device=self.device, dtype=s_preds.dtype),
+                s_preds
+            )
+
+            illegal_logits = s_preds[batch_illegal_mask]
+            violation = F.relu(illegal_logits - (-5.0))
+            if violation.numel() > 0:
+                illegal_penalty_loss = violation.mean()
+            else:
+                illegal_penalty_loss = torch.tensor(0.0, device=self.device)
+                
+            s_loss_unreduced = F.cross_entropy(s_preds_masked, s_targets, reduction='none')
+
+            batch_weights = torch.tensor(dynamic_weights, device=self.device)
+            batch_weights = batch_weights / batch_weights.mean()
+            s_loss = torch.mean(s_loss_unreduced * batch_weights)
+
+            kl_unreduced = F.kl_div(
+                F.log_softmax(active_logits, dim=-1),
+                F.softmax(ref_logits, dim=-1),
+                reduction='none'
+            ).sum(dim=-1)
+
+            masked_kl = kl_unreduced * attention_mask
+            seq_kl = masked_kl.sum() / attention_mask.sum()
+
+            decision_kl = kl_unreduced[b_idx_tensor, seq_idx_tensor].mean()
+
+            kl_loss = seq_kl + decision_kl
+
+            total_loss = s_loss + kl_loss + (0.1 * illegal_penalty_loss)
 
             if total_loss.requires_grad:
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-                
+
             train_count_obj.increment()
-
-            self.global_updates += 1
-
             self.global_updates += 1
 
             if self.global_updates % 10 == 0:
-                csv_writer.writerow([self.global_updates, s_loss.item(), kl_loss.item()])
+                csv_writer.writerow([self.global_updates, s_loss.item(), kl_loss.item(), illegal_penalty_loss.item()])
                 log_file.flush()
 
             if self.global_updates % 500 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
-                print(f"Upd {self.global_updates} | Strat Loss: {s_loss.item():.4f} | kl Loss: {kl_loss.item():.4f}")
+                print(f"Upd {self.global_updates} | Nodes: {total_nodes} | Strat: {s_loss.item():.4f} | KL: {kl_loss.item():.4f} | Pen: {illegal_penalty_loss.item():.4f}")
                 torch.save(self.model.state_dict(), f"RL-{self.global_updates}.pt")
 
-    def batch_generate_hands(self, n_hands, street_cutoff):
+    def batch_generate_hands(self, n_hands):
         hands = [Hand() for _ in range(n_hands)]
         hero_indices = [randint(0, 5) for _ in range(n_hands)]
         hero_ev_data = [[] for _ in range(n_hands)]
@@ -322,8 +362,7 @@ class Simulator:
 
             for i, idx in enumerate(active_indices):
                 hand = hands[idx]
-                if not hand.done and hand.state.turn_index == hero_indices[
-                    idx] and hand.state.street_index >= street_cutoff:
+                if not hand.done and hand.state.turn_index == hero_indices[idx]:
                     ev_indices.append(idx)
                     ev_hand_objs.append(hand)
 
@@ -370,23 +409,43 @@ class Simulator:
             active_indices = next_active_indices
 
         valid_indices = [i for i, evs in enumerate(hero_ev_data) if evs]
-
-        full_seqs = [""] * len(hands)  # Initialize with placeholders
+        full_seqs = [""] * len(hands)
 
         if valid_indices:
             current_encoders = self.encoders
 
-            def _encode_hand(encoder, hand, hero_idx):
-                return encoder.encode(json.dumps(hand.get_u_hand(hero_idx)), True, True)
+            def _process_entire_trajectory(encoder, hand, ev_nodes, hero_idx):
+                final_seq = encoder.encode(json.dumps(hand.get_u_hand(hero_idx)), True, True)
+                valid_nodes = []
+                for node in ev_nodes:
+                    state_json = node['state_json']
+
+                    hist_encoded = encoder.encode(state_json)
+                    decision_token_count = f"{hist_encoded}<herop{hero_idx}>".count('<')
+
+                    valid_nodes.append({
+                        'decision_token_count': decision_token_count,
+                        'evs': node['evs']
+                    })
+
+                return final_seq, valid_nodes
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(valid_indices)) as executor:
                 futures = [
-                    executor.submit(_encode_hand, current_encoders[idx], hands[idx], hero_indices[idx])
+                    executor.submit(
+                        _process_entire_trajectory,
+                        current_encoders[idx],
+                        hands[idx],
+                        hero_ev_data[idx],
+                        hero_indices[idx]
+                    )
                     for idx in valid_indices
                 ]
 
                 for idx, future in zip(valid_indices, futures):
-                    full_seqs[idx] = future.result()
+                    final_seq, valid_nodes = future.result()
+                    full_seqs[idx] = final_seq
+                    hero_ev_data[idx] = valid_nodes
 
         return hands, hero_ev_data, hero_indices, full_seqs
 
@@ -427,7 +486,6 @@ class Simulator:
             if call_is_allin:
                 valid_actions.discard('max_bet')
 
-            # Filter out all-in if it is more than 4x the sampled raise amount
             if max_bet > 4 * raise_size:
                 valid_actions.discard('max_bet')
             elif max_bet > 0 and raise_size >= (0.5 * max_bet):
@@ -552,16 +610,10 @@ class Simulator:
 
         logits = self.model(input_ids, attention_mask=attention_mask).logits
 
-        raise_col = torch.full((len(hands),), self.raise_token_id, device=self.device, dtype=torch.long)
-        is_raise = (input_ids == raise_col.unsqueeze(1))
-        seq_indices = torch.arange(input_ids.size(1), device=self.device).unsqueeze(0).expand_as(input_ids)
-        last_raise_indices = (is_raise.long() * seq_indices).max(dim=1).values
-
         start_id = self.min_size_token.item()
         num_sizes = len(self.sizes_floats)
 
-        size_logits = logits[torch.arange(len(hands)), last_raise_indices, start_id: start_id + num_sizes]
-
+        size_logits = logits[:, -1, start_id: start_id + num_sizes]
         batch_min_tokens = torch.tensor(min_bet_tokens, device=self.device)
         offsets = (batch_min_tokens - start_id).unsqueeze(1)
         size_indices = torch.arange(num_sizes, device=self.device).unsqueeze(0)
@@ -595,17 +647,12 @@ class Simulator:
 
         logits = self.model(input_ids, attention_mask=attention_mask).logits
 
-        is_hero = torch.isin(input_ids, self.hero_token_ids)
-        seq_indices = torch.arange(input_ids.size(1), device=self.device).unsqueeze(0).expand_as(input_ids)
-        last_hero_indices = (is_hero.long() * seq_indices).max(dim=1).values
-
         action_keys = ['fold', 'check', 'call', 'raise', 'allin']
         action_ids = [self.fold_token_id, self.check_token_id, self.call_token_id, self.raise_token_id,
                       self.allin_token_id]
         action_tensor = torch.tensor(action_ids, device=self.device)
 
-        action_logits = logits[torch.arange(len(hands)), last_hero_indices, :][:, action_tensor]
-
+        action_logits = logits[:, -1, action_tensor]
         final_actions = [''] * len(hands)
         final_sizes = [0] * len(hands)
         raise_indexes = []
@@ -696,19 +743,6 @@ class Simulator:
             self.encoder.encode(json.dumps(hand.get_u_hand(turn_idx))),
             min_bet_token, max_bet, pot_size, can_check, can_raise, can_call, call_is_allin, turn_idx
         )
-
-    def verify_and_log_state(self,text, b_idx, acts, scores, valid_probs, targets, loss, weight):
-        """Helper to print out exactly what the model sees and targets for one sample."""
-        print(f"\n--- STATE AUTOMATA VERIFICATION (Batch Index {b_idx}) ---")
-        print(f"text: {text}")
-        print(f"Legal Actions available: {acts}")
-        print(f"Raw EV Scores: {scores}")
-        print(f"Current Model Probs (Normalized over valid): {valid_probs.tolist()}")
-        print(f"Assigned Targets: {targets.tolist()}")
-        print(f"Node EV Spread Weight: {weight:.4f}")
-        print(f"Resulting Unreduced CE Loss: {loss.item():.4f}")
-        print("---------------------------------------------------------")
-
 
 if __name__ == '__main__':
     sim = Simulator()
