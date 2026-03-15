@@ -1,4 +1,4 @@
-<img width="1000" height="600" alt="image" src="https://github.com/user-attachments/assets/14720bdc-150e-4f74-ba26-eb0fbe290ef5" />
+<img width="1000" height="600" alt="image" src="https://github.com/wesboyt/donk-gpt-rl/blob/main/Algo.png" />
 
 Informative game nodes and respective action distributions:
 
