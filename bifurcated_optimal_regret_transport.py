@@ -91,11 +91,11 @@ class Simulator:
         self.raise_token_id = base_tokenizer.encode("<xxx>")[0]
         self.allin_token_id = base_tokenizer.encode("<xxx>")[0]
 
-        self.min_size_token_id = base_tokenizer.encode("<xxx>")[0]
+        self.min_size_token_id = base_tokenizer.encode("<b1%>")[0]
         self.min_size_token = torch.tensor([self.min_size_token_id]).to(self.device)
 
         # Core Tokens mapping
-        self.hero_token_ids = torch.tensor([base_tokenizer.encode(f"<xxx>")[0] for i in range(6)],
+        self.hero_token_ids = torch.tensor([base_tokenizer.encode(f"<herop{i}>")[0] for i in range(6)],
                                            device=self.device)
         self.action_tokens = {
             'fold': self.fold_token_id,
@@ -106,7 +106,7 @@ class Simulator:
         }
 
         # Token-Space Regret Supports
-        self.sizes = np.array(list(range(1, 5))..., dtype=np.float32)
+        self.sizes = np.array(list(range(1, 5)) + list(range(5, 101, 5)) + list(range(125, 501, 25)), dtype=np.float32)
         self.torch_sizes_float = torch.tensor(self.sizes).to(self.device).float()
         self.sizes_floats = self.torch_sizes_float.tolist()
 
@@ -231,7 +231,7 @@ class Simulator:
 
         batch_memory = []
 
-        while self.global_updates < 40000:
+        while self.global_updates < 100000:
             # 1. Drain Queue and Batch Preparation (Unchanged)
             while len(batch_memory) < self.batch_size:
                 try:
@@ -252,11 +252,14 @@ class Simulator:
             seq_len = input_ids.size(1)
             unpadded_lengths_cpu = attention_mask.sum(dim=1).long().tolist()
 
+            # --- 2. BASE FORWARD PASS (Up to <hero>) ---
             self.model.train()
             with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+                # We request use_cache to get the KV tensor graph
                 outputs = self.model(input_ids, attention_mask=attention_mask, use_cache=True)
                 active_logits = outputs.logits.float()
 
+                # STOP-GRADIENT BOUNDARY: Detach into a fresh native DynamicCache
                 detached_cache_data = []
                 for layer in outputs.past_key_values.layers:
                     k = layer.keys.detach() if layer.keys is not None else None
@@ -269,17 +272,24 @@ class Simulator:
                         detached_cache_data.append((k, v))
 
                 detached_pkv = DynamicCache(detached_cache_data)
+                # Assert that the first tensor in the first layer has no gradient tracking
+
+                # --- DIAGNOSTIC PART 1 ---
                 if self.global_updates == 1:
                     first_k_tensor = detached_pkv.layers[0].keys
                     assert not first_k_tensor.requires_grad, "Error: Detached PKV still requires grad."
                     assert first_k_tensor.grad_fn is None, "Error: Detached PKV still has a grad_fn."
+                # -------------------------.
 
                 with torch.no_grad():
                     ref_logits = self.ref_model(input_ids, attention_mask=attention_mask).logits.float()
 
-            policy_loss = torch.tensor(0.0, device=self.device)
-            regret_loss = torch.tensor(0.0, device=self.device)
             total_nodes = 0
+
+            # Lists to store unreduced losses and spread weights for batch normalization
+            unreduced_policy_losses = []
+            unreduced_regret_losses = []
+            dynamic_ev_weights = []
 
             # --- 3. REGRET BRANCH & STRATEGY LABEL GENERATION ---
             for b in range(self.batch_size):
@@ -292,8 +302,12 @@ class Simulator:
                     acts = batch_samples[b]['legal_actions'][i]
                     scores = batch_samples[b]['ev_scores'][i]
 
-                    # 3A. Calculate Distance from Optimal (Shortfall)
+                    # Calculate EV Spread for scaling
                     max_score = max(scores)
+                    min_score = min(scores)
+                    spread = max_score - min_score
+                    dynamic_ev_weights.append(float(spread) + 1e-3)
+
                     true_distances = [max_score - s for s in scores]
 
                     num_acts = len(acts)
@@ -306,14 +320,12 @@ class Simulator:
                         suffix_ids[a_idx, 0] = self.unk_token_id
                         suffix_ids[a_idx, 1] = self.action_tokens[act_str]
 
-                        # 3B. Find the token index where size > distance
-                        bucket_idx = num_sizes - 1  # Default to max size if it exceeds bounds
+                        bucket_idx = num_sizes - 1
                         for j, size_val in enumerate(self.sizes_floats):
                             if size_val > true_distances[a_idx]:
                                 bucket_idx = j
                                 break
 
-                        # Set a one-hot distribution at the exact target bucket
                         target_bucket_probs[a_idx, bucket_idx] = 1.0
 
                     # Expand the detached PKV specifically for this node's branch
@@ -332,7 +344,7 @@ class Simulator:
 
                     branch_mask = torch.ones((num_acts, hero_token_idx + 3), device=self.device)
 
-                    # Shallow Forward Pass for <unk><action>
+                    # Shallow Forward Pass
                     with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
                         branch_outputs = self.model(
                             input_ids=suffix_ids,
@@ -342,26 +354,19 @@ class Simulator:
 
                     branch_logits = branch_outputs.logits.float()
 
-                    # -------------------------------------------------------------
-                    # OPTIMAL TRANSPORT REGRET LOSS
-                    # Slice out only the vocabulary logits corresponding to the sizes
-                    # -------------------------------------------------------------
+                    # Calculate unreduced OT Regret Loss for this specific node
                     bucket_logits = branch_logits[:, 1, self.min_size_token_id: self.min_size_token_id + num_sizes]
-                    regret_loss += self.wasserstein_loss(bucket_logits, target_bucket_probs)
+                    node_ot_loss = self.wasserstein_loss(bucket_logits, target_bucket_probs)
+                    unreduced_regret_losses.append(node_ot_loss)
 
-                    # 3C. Generate Strategy Labels from Predictions
+                    # Generate Strategy Labels from Predictions
                     with torch.no_grad():
                         pred_bucket_probs = F.softmax(bucket_logits, dim=-1)
-
-                        # Expected distance from optimal
                         expected_distances = torch.sum(pred_bucket_probs * self.torch_sizes_float, dim=-1)
 
-                        # Convert distances back to standard regrets:
-                        # Value = -Distance. Regret = Value - Mean(Value) = Mean(Distance) - Distance
                         mean_distance = expected_distances.mean()
                         pred_regrets = mean_distance - expected_distances
 
-                        # Regret Matching
                         pos_regrets = torch.clamp(pred_regrets, min=0.0)
                         sum_pos_regrets = pos_regrets.sum()
 
@@ -374,18 +379,23 @@ class Simulator:
                         act_token_ids = [self.action_tokens[a] for a in acts]
                         target_policy[act_token_ids] = probs
 
-                    # Policy Loss (at the <hero> token)
+                    # Calculate unreduced Policy Loss for this specific node
                     hero_logits = active_logits[b, hero_token_idx, :]
-                    policy_loss += F.cross_entropy(hero_logits, target_policy)
+                    node_p_loss = F.cross_entropy(hero_logits, target_policy)
+                    unreduced_policy_losses.append(node_p_loss)
 
-            # Normalize losses
-            policy_loss = policy_loss / total_nodes
-            regret_loss = regret_loss / total_nodes
+            # --- 4. BATCH NORMALIZATION AND LOSS SCALING ---
+            stacked_regret_losses = torch.stack(unreduced_regret_losses)
+            stacked_policy_losses = torch.stack(unreduced_policy_losses)
 
-            # ... end of batch loop ...
+            weights_tensor = torch.tensor(dynamic_ev_weights, device=self.device)
 
-            policy_loss = policy_loss / total_nodes
-            regret_loss = regret_loss / total_nodes
+            # Normalize weights so the mean is 1.0 to preserve the global learning rate scale
+            weights_tensor = weights_tensor / weights_tensor.mean()
+
+            # Calculate the final scalar losses
+            regret_loss = torch.mean(stacked_regret_losses * weights_tensor)
+            policy_loss = torch.mean(stacked_policy_losses * weights_tensor)
 
             # --- DIAGNOSTIC PART 2 ---
             if self.global_updates == 1:
@@ -441,7 +451,11 @@ class Simulator:
             kl_loss = masked_kl.sum() / attention_mask.sum()
 
             # Combined Optimization
-            total_loss = policy_loss + regret_loss + kl_loss
+            if self.global_updates > 5000:
+                policy_mask = 1.0
+            else:
+                policy_mask = 0.0
+            total_loss = policy_mask * policy_loss + regret_loss + kl_loss
 
             if total_loss.requires_grad:
                 total_loss.backward()
