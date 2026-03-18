@@ -27,22 +27,23 @@ import concurrent.futures
 class NonUniformWasserstein1DLoss(torch.nn.Module):
     def __init__(self, sizes_tensor):
         super().__init__()
-        # Calculate the physical distance between consecutive atoms
-        # sizes_tensor shape: [num_sizes]
-        # delta_z shape: [num_sizes - 1]
-        self.delta_z = torch.diff(sizes_tensor)
+        # Get the maximum size (e.g., 500.0) to normalize the physical distances
+        self.max_size = sizes_tensor[-1]
+
+        # Calculate the physical distance between consecutive atoms and normalize
+        # Now the sum of all delta_z equals ~1.0 instead of 500.0
+        self.delta_z = torch.diff(sizes_tensor) / self.max_size
 
     def forward(self, pred_logits, target_probs):
         pred_probs = torch.softmax(pred_logits, dim=-1)
 
         # Calculate Cumulative Distribution Functions
-        # We drop the last element because diffs only exist between elements
         pred_cdf = torch.cumsum(pred_probs, dim=-1)[..., :-1]
         target_cdf = torch.cumsum(target_probs, dim=-1)[..., :-1]
 
         cdf_diff = torch.abs(pred_cdf - target_cdf)
 
-        # Multiply the CDF mass differences by the physical step sizes and sum
+        # Multiply the CDF mass differences by the normalized physical step sizes and sum
         return torch.sum(cdf_diff * self.delta_z, dim=-1).mean()
 
 
@@ -91,11 +92,11 @@ class Simulator:
         self.raise_token_id = base_tokenizer.encode("<xxx>")[0]
         self.allin_token_id = base_tokenizer.encode("<xxx>")[0]
 
-        self.min_size_token_id = base_tokenizer.encode("<b1%>")[0]
+        self.min_size_token_id = base_tokenizer.encode("<xxx>")[0]
         self.min_size_token = torch.tensor([self.min_size_token_id]).to(self.device)
 
         # Core Tokens mapping
-        self.hero_token_ids = torch.tensor([base_tokenizer.encode(f"<herop{i}>")[0] for i in range(6)],
+        self.hero_token_ids = torch.tensor([base_tokenizer.encode(f"<xxx>")[0] for i in range(6)],
                                            device=self.device)
         self.action_tokens = {
             'fold': self.fold_token_id,
@@ -106,7 +107,7 @@ class Simulator:
         }
 
         # Token-Space Regret Supports
-        self.sizes = np.array(list(range(1, 5)) + list(range(5, 101, 5)) + list(range(125, 501, 25)), dtype=np.float32)
+        self.sizes = np.array(list(range(1, 5))...), dtype=np.float32)
         self.torch_sizes_float = torch.tensor(self.sizes).to(self.device).float()
         self.sizes_floats = self.torch_sizes_float.tolist()
 
@@ -115,7 +116,7 @@ class Simulator:
         # Optimizer (Only used by trainer process)
         self.optimizer = schedulefree.AdamWScheduleFree(
             self.model.parameters(),
-            lr=1e-6,
+            lr=1e-4,
             warmup_steps=0,
             betas=(0.9, 0.999),
             weight_decay=0.0  # <--- FIX: Disabled to prevent logit compression
@@ -124,7 +125,7 @@ class Simulator:
 
         # Engine Params
         self.n_sims = 8
-        self.batch_size = 8
+        self.batch_size = 2
         self.global_updates = 0
 
 
@@ -231,7 +232,7 @@ class Simulator:
 
         batch_memory = []
 
-        while self.global_updates < 100000:
+        while self.global_updates < 1000000:
             # 1. Drain Queue and Batch Preparation (Unchanged)
             while len(batch_memory) < self.batch_size:
                 try:
@@ -262,8 +263,12 @@ class Simulator:
                 # STOP-GRADIENT BOUNDARY: Detach into a fresh native DynamicCache
                 detached_cache_data = []
                 for layer in outputs.past_key_values.layers:
-                    k = layer.keys.detach() if layer.keys is not None else None
-                    v = layer.values.detach() if layer.values is not None else None
+                    if self.global_updates <= 100000:
+                        k = layer.keys.detach() if layer.keys is not None else None
+                        v = layer.values.detach() if layer.values is not None else None
+                    else:
+                        k = layer.keys
+                        v = layer.values
                     sliding_tensor = getattr(layer, "_sliding_window_tensor", None)
 
                     if sliding_tensor is not None:
@@ -342,7 +347,14 @@ class Simulator:
 
                     node_pkv = DynamicCache(node_cache_data)
 
-                    branch_mask = torch.ones((num_acts, hero_token_idx + 3), device=self.device)
+                    # Inherit the exact mask up to the hero token, maintaining left-padding zeros
+                    base_mask_slice = attention_mask[b:b + 1, :hero_token_idx + 1].expand(num_acts, -1)
+
+                    # Apply ones only to the new <unk> and <action> tokens
+                    suffix_mask = torch.ones((num_acts, 2), device=self.device)
+
+                    # Concatenate for the correct sequential mask
+                    branch_mask = torch.cat([base_mask_slice, suffix_mask], dim=1)
 
                     # Shallow Forward Pass
                     with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
@@ -451,10 +463,13 @@ class Simulator:
             kl_loss = masked_kl.sum() / attention_mask.sum()
 
             # Combined Optimization
-            if self.global_updates > 5000:
-                policy_mask = 1.0
+            if self.global_updates < 100000:
+                if self.global_updates > 90000:
+                    policy_mask = (self.global_updates - 90000) / 10000
+                else:
+                    policy_mask = 0.0
             else:
-                policy_mask = 0.0
+                policy_mask = 1.0
             total_loss = policy_mask * policy_loss + regret_loss + kl_loss
 
             if total_loss.requires_grad:
@@ -469,7 +484,7 @@ class Simulator:
                 csv_writer.writerow([self.global_updates, policy_loss.item(), regret_loss.item(), kl_loss.item()])
                 log_file.flush()
 
-            if self.global_updates % 500 == 0:
+            if self.global_updates % 5000 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
                 print(f"Upd {self.global_updates} | Nodes: {total_nodes} | Pol: {policy_loss.item():.4f} | Reg: {regret_loss.item():.4f} | KL: {kl_loss.item():.4f}")
